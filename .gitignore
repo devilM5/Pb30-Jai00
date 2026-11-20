@@ -17,3 +17,17 @@ local.properties
 .env
 debug.keystore
 *-debug.log
+
+# AI Model Binaries & Secrets (Never commit to GitHub)
+*.gguf
+*.gguf.part
+*.safetensors
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+!debug.keystore.base64
+.env.*
+!.env.example
+

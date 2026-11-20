@@ -79,7 +79,7 @@ fun WebResearchTab(
     ) {
         item {
             SecurityDisclaimerBanner(
-                text = "Live Web Research uses Firebase AI Logic with Google Search Grounding & URL Context to summarize websites and documentation.",
+                text = "Live Web & YouTube Research queries real public web, NVD CVE, webpage & YouTube caption endpoints (SSRF-safe) and summarizes locally with Dhīr 2B.",
                 isSimulated = false
             )
         }
@@ -90,7 +90,7 @@ fun WebResearchTab(
                     Icon(Icons.Default.Language, contentDescription = null, tint = NeonCyan)
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        text = "WEB RESEARCH & URL SUMMARIZER",
+                        text = "WEB, URL & YOUTUBE RESEARCH",
                         style = MaterialTheme.typography.titleSmall,
                         color = NeonCyan
                     )
@@ -99,7 +99,7 @@ fun WebResearchTab(
                 OutlinedTextField(
                     value = query,
                     onValueChange = { query = it },
-                    placeholder = { Text("Enter a topic, CVE, or paste https:// documentation URL…") },
+                    placeholder = { Text("Enter a topic, CVE, YouTube query/URL, or https:// link…") },
                     minLines = 2,
                     maxLines = 4,
                     colors = OutlinedTextFieldDefaults.colors(
@@ -193,7 +193,46 @@ fun WebResearchTab(
                             }
                         }
                         Spacer(Modifier.height(8.dp))
+                        if (res.modeNote.isNotBlank()) {
+                            Text(
+                                text = res.modeNote,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(4.dp))
+                        }
                         Text(res.answer, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+
+                        if (res.youtubeResults.isNotEmpty()) {
+                            Spacer(Modifier.height(12.dp))
+                            Text("YOUTUBE VIDEOS & TRANSCRIPTS", style = MaterialTheme.typography.labelMedium, color = NeonCrimson)
+                            Spacer(Modifier.height(6.dp))
+                            res.youtubeResults.forEach { yt ->
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            runCatching {
+                                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(yt.url)))
+                                            }
+                                        }
+                                        .padding(vertical = 4.dp)
+                                ) {
+                                    Text(
+                                        text = "${yt.title} (${yt.channel})${if (yt.durationLabel.isNotBlank()) " • ${yt.durationLabel}" else ""}",
+                                        style = MaterialTheme.typography.labelMedium.copy(textDecoration = TextDecoration.Underline),
+                                        color = NeonCrimson
+                                    )
+                                    if (yt.transcriptExcerpt.isNotBlank()) {
+                                        Text(
+                                            text = yt.transcriptExcerpt.take(260),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
 
                         if (res.citations.isNotEmpty()) {
                             Spacer(Modifier.height(12.dp))

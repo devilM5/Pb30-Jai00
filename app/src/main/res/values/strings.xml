@@ -5,7 +5,7 @@
     <string name="sign_in_with_google">Sign in with Google</string>
     <string name="sign_out">Sign out</string>
     <string name="auth_clearance_title">FRIDAY SECURITY CLEARANCE</string>
-    <string name="auth_clearance_subtitle">Authenticate with Google to sync encrypted learning notes, chat history, and activate Firebase AI Logic.</string>
+    <string name="auth_clearance_subtitle">Sign in with Google for encrypted Firestore cloud backup &amp; sync, or continue offline with local Dhīr 2B AI and Room storage.</string>
     <string name="ethical_notice_short">Authorized Education &amp; Defensive Analysis Only. No unauthorized scanning or exploitation.</string>
     <string name="sim_lab_badge">SIMULATED LAB OUTPUT</string>
     <string name="real_ai_badge">AUTHORIZED ANALYSIS</string>

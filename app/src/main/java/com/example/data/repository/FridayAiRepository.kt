@@ -1,139 +1,216 @@
 package com.example.data.repository
 
 import android.util.Log
+import com.example.ai.DhirModelManager
+import com.example.ai.DhirPromptFormatter
+import com.example.ai.DhirTurn
+import com.example.ai.LlamaInferenceEngine
 import com.example.data.model.AgentType
 import com.example.data.model.AiModelOption
+import com.example.data.model.DhirModelStatus
 import com.example.data.model.LanguageMode
 import com.example.data.model.WebCitation
 import com.example.data.model.WebResearchResult
-import com.google.firebase.Firebase
-import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.Content
-import com.google.firebase.ai.type.Tool
-import com.google.firebase.ai.type.content
+import com.example.data.model.YouTubeVideoSummary
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeout
+import java.io.File
 
 interface FridayAiRepository {
     fun streamResponse(
         prompt: String,
         languageMode: LanguageMode,
         agentType: AgentType,
-        modelOption: AiModelOption = AiModelOption.FLASH_3_8,
-        history: List<Pair<String, String>> = emptyList()
+        modelOption: AiModelOption = AiModelOption.DHIR_2B_BALANCED,
+        history: List<Pair<String, String>> = emptyList(),
+        toolsJson: String? = null
     ): Flow<String>
 
     suspend fun performWebResearch(
         query: String,
         languageMode: LanguageMode,
         explainInHindi: Boolean,
-        modelOption: AiModelOption = AiModelOption.FLASH_3_8
+        modelOption: AiModelOption = AiModelOption.DHIR_2B_BALANCED
     ): WebResearchResult
+
+    suspend fun ensureDhirLoaded(modelOption: AiModelOption): Result<Unit>
+    fun unloadDhir()
+    fun abortGeneration()
 }
 
-class FirebaseFridayAiRepository : FridayAiRepository {
+/**
+ * Local Dhīr 2B (`dhir-2b-Q4_K_M.gguf`) AI engine backed by `llama.cpp` JNI (`dhir-support`)
+ * plus `WebToolsRepository` for grounded internet, website, and YouTube research.
+ *
+ * Strictly zero Gemini, ChatGPT, or cloud LLM calls.
+ */
+class DhirFridayAiRepository(
+    private val modelManager: DhirModelManager,
+    private val llamaBridge: LlamaInferenceEngine,
+    private val webToolsRepository: WebToolsRepository = WebToolsRepository()
+) : FridayAiRepository {
 
-    private fun buildSystemPrompt(
+    fun buildSystemPrompt(
         languageMode: LanguageMode,
         agentType: AgentType
     ): String {
         val languageInstruction = when (languageMode) {
             LanguageMode.HINGLISH ->
-                "Respond primarily in clear, natural Hinglish (Hindi written in Roman script mixed with accurate English technical terms) unless the user writes purely in English or Devanagari Hindi."
+                "Respond primarily in natural Hinglish (Hindi in Roman script mixed with clear English technical terms) unless the user writes purely in English or Devanagari Hindi."
             LanguageMode.HINDI ->
-                "Respond in clear, natural Hindi (Devanagari script: हिन्दी) while keeping exact code syntax, CLI flags, CVE IDs, and technical terms in English for precision."
+                "Respond in clear, natural Hindi (Devanagari script: हिन्दी) while keeping exact code syntax, CLI flags, CVE IDs, and technical terms in English."
             LanguageMode.ENGLISH ->
-                "Respond in crisp, authoritative, professional English."
+                "Respond in clear, concise, authoritative English."
         }
 
         val roleInstruction = when (agentType) {
             AgentType.CHAT ->
-                "You are FRIDAY, the conversational personal AI assistant, software engineer mentor, and authorized cybersecurity guide inside PB-30 JAI - FRIDAY Security AI. Answer general knowledge, coding, Linux, and defensive security questions clearly and step-by-step."
+                "You are FRIDAY, the on-device AI assistant, coding mentor, and authorized cybersecurity guide inside PB-30 JAI - FRIDAY Security AI, powered locally by Dhīr 2B."
             AgentType.RESEARCH ->
-                "You are FRIDAY's Research Agent. Provide structured threat-intelligence and technical research (OWASP, NIST, MITRE ATT&CK, CVE/CWE concepts, cloud/software architecture) with clear sections: Overview, Threat/Technical Vector, Defensive Controls, and Key Takeaways."
+                "You are FRIDAY's Research Agent. Organize threat intelligence and technical findings (OWASP, NIST, MITRE ATT&CK, CVE/CWE) into Overview, Technical Vector, Defensive Controls, and Key Takeaways."
             AgentType.LEARNING ->
-                "You are FRIDAY's Security Learning Agent. Teach concepts step by step using beginner-friendly analogies, safe lab command explanations, and a quick self-check question at the end."
+                "You are FRIDAY's Security Learning Agent. Explain concepts step by step using clear analogies, safe lab examples, and one quick self-check question."
             AgentType.CODE_ANALYSIS ->
-                "You are FRIDAY's Code Analysis Agent. Perform a defensive static code/configuration review on the snippet provided. Output: (1) Identified Risks & Severity, (2) Why It Matters, and (3) Secure Fixed Code."
+                "You are FRIDAY's Code Analysis Agent. Review code defensively: (1) Identified Risks & Severity, (2) Impact, and (3) Secure Fixed Code."
             AgentType.REPORT_ANALYSIS ->
-                "You are FRIDAY's Report Analysis Agent. Analyze authorized Nmap/ZAP/HTTP/system scan logs. Categorize findings by Severity (Critical/High/Medium/Low), explain root cause, and give concrete remediation commands/configs."
+                "You are FRIDAY's Report Analysis Agent. Analyze authorized scan/log findings by severity, root cause, and remediation steps."
             AgentType.CODING ->
-                "You are FRIDAY's Coding Agent expert in Python, Java, Kotlin, JavaScript, and Bash. Provide clean, production-safe code blocks, clear line-by-line explanations when requested, root-cause debugging for stack traces/errors, and exact fixes."
+                "You are FRIDAY's Coding Agent for Python, Java, Kotlin, JavaScript, and Bash. Give clean, safe code blocks and debugging fixes."
             AgentType.FILE_ANALYSIS ->
-                "You are FRIDAY's File Agent. Review the uploaded source code or document carefully. Summarize architecture/purpose, identify bugs or security flaws with line references, and when asked to propose an edit, provide clear updated code clearly marked as a proposed patch awaiting operator approval."
+                "You are FRIDAY's File Agent. Summarize architecture, find bugs or risks with specifics, and suggest safe edits marked for operator approval."
             AgentType.WEB_RESEARCH ->
-                "You are FRIDAY's Web Research Agent. Synthesize accurate, up-to-date answers grounded in web search and provided URLs, highlighting authoritative sources and practical takeaways."
+                "You are FRIDAY's Web Research Agent. Synthesize only facts present in the retrieved web, website, CVE, or YouTube transcript observations and cite source links accurately."
             AgentType.TERMINAL_REVIEW ->
-                "You are FRIDAY's Terminal Agent safety reviewer. Explain what each command and flag does, highlight potential side effects, and recommend safer read-only or scoped alternatives if needed. Never claim a command executed unless bridge output was provided."
+                "You are FRIDAY's Terminal Agent safety reviewer. Explain commands and flags clearly and recommend safe alternatives. Never claim a command executed unless tool output confirms it."
         }
 
         val safetyGuardrail = """
-            STRICT ETHICAL & SAFETY POLICY:
-            - You ONLY teach ethical, authorized, and defensive cybersecurity and safe software engineering.
-            - NEVER generate exploit payloads, malware, ransomware, credential-stuffing scripts, or instructions to attack unauthorized systems.
-            - Never claim to have scanned a live target or executed a shell command yourself — terminal/sandbox execution always requires explicit operator approval through the app bridge.
-            - Never expose secrets or encourage hardcoding passwords/API keys.
+            STRICT SECURITY & HONESTY RULES:
+            - Teach and assist ONLY with ethical, authorized, defensive cybersecurity and safe software engineering.
+            - Never generate exploit payloads, malware, credential-stuffing scripts, or unauthorized attack steps.
+            - Never claim a web search, file edit, or terminal scan happened unless an observation block confirms it.
+            - Terminal/SSH commands must always go through prepare_terminal_command for explicit user approval.
         """.trimIndent()
 
         return "$roleInstruction\n\n$languageInstruction\n\n$safetyGuardrail"
     }
 
-    private fun createModel(
-        languageMode: LanguageMode,
-        agentType: AgentType,
-        modelOption: AiModelOption
-    ) = Firebase.ai.generativeModel(
-        modelName = modelOption.modelId,
-        systemInstruction = content {
-            text(buildSystemPrompt(languageMode, agentType))
+    override suspend fun ensureDhirLoaded(modelOption: AiModelOption): Result<Unit> {
+        val modelFile: File = modelManager.findInstalledDhirFile()
+            ?: return Result.failure(
+                IllegalStateException(
+                    "Local AI model 'dhir-2b-Q4_K_M.gguf' is not installed yet. Open Model Manager to import or download it."
+                )
+            )
+
+        val currentState = modelManager.inspectModelState(
+            loadedFilePath = llamaBridge.getLoadedModelPath(),
+            effectiveCtx = llamaBridge.getLoadedContextSize(),
+            arch = llamaBridge.getModelArchitecture()
+        )
+        val recommendedCtx = DhirModelManager.recommendContextSize(
+            totalRamMb = currentState.totalDeviceRamMb,
+            requestedCtx = modelOption.contextSize
+        )
+
+        if (llamaBridge.getLoadedModelPath() == modelFile.absolutePath &&
+            llamaBridge.getLoadedContextSize() == recommendedCtx
+        ) {
+            modelManager.updateRuntimeLoadedStatus(
+                loadedPath = modelFile.absolutePath,
+                effectiveCtx = recommendedCtx,
+                arch = llamaBridge.getModelArchitecture()
+            )
+            return Result.success(Unit)
         }
-    )
+
+        modelManager.updateRuntimeLoadedStatus(loadedPath = null, isLoading = true)
+        val cpuThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
+        val res = llamaBridge.loadModel(modelFile.absolutePath, recommendedCtx, cpuThreads)
+        return res.fold(
+            onSuccess = { arch ->
+                modelManager.updateRuntimeLoadedStatus(
+                    loadedPath = modelFile.absolutePath,
+                    effectiveCtx = recommendedCtx,
+                    arch = arch
+                )
+                Result.success(Unit)
+            },
+            onFailure = { err ->
+                modelManager.updateRuntimeLoadedStatus(loadedPath = null, errorMessage = err.message)
+                Result.failure(err)
+            }
+        )
+    }
+
+    override fun unloadDhir() {
+        llamaBridge.unloadModel()
+        modelManager.refreshState()
+    }
+
+    override fun abortGeneration() {
+        llamaBridge.abortGeneration()
+    }
 
     override fun streamResponse(
         prompt: String,
         languageMode: LanguageMode,
         agentType: AgentType,
         modelOption: AiModelOption,
-        history: List<Pair<String, String>>
+        history: List<Pair<String, String>>,
+        toolsJson: String?
     ): Flow<String> = flow {
-        val model = createModel(languageMode, agentType, modelOption)
-        val accumulated = StringBuilder()
+        ensureDhirLoaded(modelOption).getOrThrow()
 
-        try {
-            withTimeout(AI_TIMEOUT_MS) {
-                val stream = if (agentType == AgentType.CHAT && history.isNotEmpty()) {
-                    val chatHistory: List<Content> = history.takeLast(16).map { (role, msg) ->
-                        content(role = if (role == "FRIDAY") "model" else "user") {
-                            text(msg)
-                        }
+        val systemPrompt = buildSystemPrompt(languageMode, agentType)
+        val turns = buildList {
+            if (agentType == AgentType.CHAT && history.isNotEmpty()) {
+                history.takeLast(8).forEach { (role, content) ->
+                    val normalized = if (role.equals("FRIDAY", ignoreCase = true) || role.equals("assistant", ignoreCase = true)) {
+                        "assistant"
+                    } else if (role.equals("observation", ignoreCase = true)) {
+                        "observation"
+                    } else {
+                        "user"
                     }
-                    val chat = model.startChat(history = chatHistory)
-                    chat.sendMessageStream(prompt)
-                } else {
-                    model.generateContentStream(prompt)
-                }
-
-                stream.collect { chunk ->
-                    val chunkText = chunk.text.orEmpty()
-                    if (chunkText.isNotEmpty()) {
-                        accumulated.append(chunkText)
-                        emit(accumulated.toString())
-                    }
+                    add(DhirTurn(role = normalized, content = content.take(1200)))
                 }
             }
-            if (accumulated.isBlank()) {
-                throw IllegalStateException("FRIDAY returned an empty response. Please try again.")
+            add(DhirTurn(role = "user", content = prompt))
+        }
+
+        val formattedPrompt = DhirPromptFormatter.formatPrompt(
+            systemPrompt = systemPrompt,
+            turns = turns,
+            toolsJson = toolsJson
+        )
+
+        var latest = ""
+        try {
+            withTimeout(LOCAL_INFERENCE_TIMEOUT_MS) {
+                llamaBridge.streamCompletion(
+                    formattedPrompt = formattedPrompt,
+                    maxTokens = modelOption.maxTokens,
+                    temperature = modelOption.temperature
+                ).collect { partial ->
+                    latest = partial
+                    emit(partial)
+                }
+            }
+            if (latest.isBlank()) {
+                throw IllegalStateException("Dhīr 2B produced an empty response.")
             }
         } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Firebase AI generation timed out", e)
-            throw IllegalStateException("FRIDAY request timed out after 60 seconds. Please check network and retry.", e)
+            Log.e(TAG, "Dhīr local inference timed out", e)
+            llamaBridge.abortGeneration()
+            if (latest.isBlank()) {
+                throw IllegalStateException("Dhīr local inference timed out after 120s.", e)
+            }
         } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "Firebase AI generation failed", e)
+            llamaBridge.abortGeneration()
             throw e
         }
     }
@@ -144,65 +221,165 @@ class FirebaseFridayAiRepository : FridayAiRepository {
         explainInHindi: Boolean,
         modelOption: AiModelOption
     ): WebResearchResult {
+        val cleanQuery = query.trim()
         val effectiveLanguage = if (explainInHindi) LanguageMode.HINDI else languageMode
-        val hasUrl = Regex("""https?://\S+""").containsMatchIn(query)
-        val tools = if (hasUrl) {
-            listOf(Tool.googleSearch(), Tool.urlContext())
+        val citations = mutableListOf<WebCitation>()
+        val queriesUsed = mutableListOf<String>()
+        var youtubeResults = emptyList<YouTubeVideoSummary>()
+        val evidenceSections = mutableListOf<String>()
+
+        // 1. Check direct URL extraction (Webpage or YouTube URL)
+        val directUrl = Regex("""https?://[^\s<>"]+""", RegexOption.IGNORE_CASE).find(cleanQuery)?.value
+        val isYouTubeIntent = cleanQuery.contains("youtube", ignoreCase = true) ||
+            cleanQuery.contains("youtu.be", ignoreCase = true) ||
+            cleanQuery.contains("transcript", ignoreCase = true) ||
+            cleanQuery.contains("video", ignoreCase = true)
+
+        if (directUrl != null && webToolsRepository.extractYouTubeVideoId(directUrl) != null) {
+            queriesUsed += directUrl
+            val ytRes = webToolsRepository.searchYouTubeAndTranscripts(directUrl, maxVideos = 1)
+            ytRes.onSuccess { videos ->
+                youtubeResults = videos
+                videos.forEach { v ->
+                    citations += WebCitation(title = "YouTube: ${v.title}", url = v.url)
+                    evidenceSections += "YouTube Video: ${v.title} (${v.channel})\nURL: ${v.url}\nTranscript (${if (v.transcriptAvailable) "Available" else "Unavailable"}):\n${v.transcriptExcerpt}"
+                }
+            }.onFailure { err ->
+                evidenceSections += "YouTube retrieval failed: ${err.localizedMessage}"
+            }
         } else {
-            listOf(Tool.googleSearch())
+            if (directUrl != null) {
+                queriesUsed += directUrl
+                webToolsRepository.fetchWebsiteContent(directUrl)
+                    .onSuccess { page ->
+                        citations += WebCitation(title = page.title, url = page.url)
+                        evidenceSections += "Fetched Website: ${page.title}\nURL: ${page.url}\nExtracted Content:\n${page.textContent.take(3000)}"
+                    }
+                    .onFailure { err ->
+                        evidenceSections += "Website fetch failed ($directUrl): ${err.localizedMessage}"
+                    }
+            }
+
+            if (isYouTubeIntent) {
+                val ytQuery = cleanQuery.replace(Regex("""(?i)\b(youtube|video|transcript)\b"""), "").trim().ifBlank { cleanQuery }
+                queriesUsed += "youtube:$ytQuery"
+                webToolsRepository.searchYouTubeAndTranscripts(ytQuery, maxVideos = 3)
+                    .onSuccess { videos ->
+                        youtubeResults = videos
+                        videos.forEach { v ->
+                            citations += WebCitation(title = "YouTube: ${v.title}", url = v.url)
+                        }
+                        if (videos.isNotEmpty()) {
+                            val top = videos.first()
+                            evidenceSections += buildString {
+                                appendLine("Top YouTube Match: ${top.title} (${top.channel}) ${top.durationLabel}")
+                                appendLine("URL: ${top.url}")
+                                appendLine("Transcript: ${top.transcriptExcerpt.take(2200)}")
+                            }
+                        }
+                    }
+            }
+
+            // General live web search (always run unless user only pasted an exact URL and got clean page)
+            if (directUrl == null || evidenceSections.isEmpty()) {
+                queriesUsed += cleanQuery
+                val searchRes = webToolsRepository.searchWeb(cleanQuery, maxResults = 5)
+                searchRes.onSuccess { hits ->
+                    citations += webToolsRepository.hitsToCitations(hits)
+                    if (hits.isNotEmpty()) {
+                        evidenceSections += buildString {
+                            appendLine("Live Web Search Results:")
+                            hits.forEachIndexed { idx, h ->
+                                appendLine("${idx + 1}. ${h.title} (${h.source})")
+                                appendLine("   URL: ${h.url}")
+                                if (h.snippet.isNotBlank()) appendLine("   Summary: ${h.snippet}")
+                            }
+                        }
+                    }
+                }.onFailure { err ->
+                    if (evidenceSections.isEmpty()) {
+                        throw IllegalStateException(err.localizedMessage ?: "Live search failed. Check internet connectivity.")
+                    }
+                }
+            }
         }
 
-        val groundedModel = Firebase.ai.generativeModel(
-            modelName = modelOption.modelId,
-            tools = tools,
-            systemInstruction = content {
-                text(buildSystemPrompt(effectiveLanguage, AgentType.WEB_RESEARCH))
+        val distinctCitations = citations.distinctBy { it.url }
+        if (evidenceSections.isEmpty()) {
+            throw IllegalStateException("No search results or readable page content found for '$cleanQuery'.")
+        }
+
+        val combinedEvidence = evidenceSections.joinToString("\n\n---\n\n")
+
+        // 2. Synthesize retrieved real sources using local Dhīr 2B if installed, else return honest retrieved digest
+        val modelReady = modelManager.findInstalledDhirFile() != null &&
+            modelManager.state.value.nativeBackendReady
+
+        val synthesizedAnswer = if (modelReady) {
+            runCatching {
+                val synthPrompt = """
+                    User Query: $cleanQuery
+
+                    Retrieved Real Evidence:
+                    $combinedEvidence
+
+                    Task: Synthesize an accurate, clear answer grounded strictly in the retrieved evidence above. List key takeaways and cite source URLs where relevant.
+                """.trimIndent()
+                val rawOut = StringBuilder()
+                streamResponse(
+                    prompt = synthPrompt,
+                    languageMode = effectiveLanguage,
+                    agentType = AgentType.WEB_RESEARCH,
+                    modelOption = modelOption
+                ).collect { chunk ->
+                    rawOut.clear()
+                    rawOut.append(chunk)
+                }
+                DhirPromptFormatter.cleanVisibleText(rawOut.toString())
+            }.getOrElse { err ->
+                buildRawRetrievalFallback(
+                    cleanQuery = cleanQuery,
+                    evidence = combinedEvidence,
+                    notice = "Local Dhīr synthesis failed (${err.localizedMessage}); showing retrieved sources directly."
+                )
+            }
+        } else {
+            buildRawRetrievalFallback(
+                cleanQuery = cleanQuery,
+                evidence = combinedEvidence,
+                notice = "Retrieved real web/YouTube results directly. Import dhir-2b-Q4_K_M.gguf to enable on-device AI summarization in ${effectiveLanguage.displayLabel}."
+            )
+        }
+
+        return WebResearchResult(
+            query = cleanQuery,
+            answer = synthesizedAnswer,
+            citations = distinctCitations,
+            searchQueriesUsed = queriesUsed.distinct(),
+            explainedInHindi = explainInHindi || effectiveLanguage == LanguageMode.HINDI,
+            youtubeResults = youtubeResults,
+            modeNote = if (modelManager.findInstalledDhirFile() != null) {
+                "Synthesized by local Dhīr 2B from real HTTP sources"
+            } else {
+                "Direct HTTP retrieval (import dhir-2b-Q4_K_M.gguf for AI synthesis)"
             }
         )
+    }
 
-        return try {
-            val response = withTimeout(AI_TIMEOUT_MS) {
-                groundedModel.generateContent(query)
-            }
-            val answer = response.text?.takeIf { it.isNotBlank() }
-                ?: throw IllegalStateException("Web Research returned an empty response.")
-
-            val metadata = response.candidates.firstOrNull()?.groundingMetadata
-            val searchQueries = metadata?.webSearchQueries.orEmpty()
-            val citations = metadata?.groundingChunks
-                ?.mapNotNull { chunk ->
-                    val web = chunk.web
-                    val uri = web?.uri
-                    if (!uri.isNullOrBlank()) {
-                        WebCitation(
-                            title = web.title?.takeIf { it.isNotBlank() } ?: uri,
-                            url = uri
-                        )
-                    } else null
-                }
-                ?.distinctBy { it.url }
-                .orEmpty()
-
-            WebResearchResult(
-                query = query,
-                answer = answer,
-                citations = citations,
-                searchQueriesUsed = searchQueries,
-                explainedInHindi = explainInHindi || effectiveLanguage == LanguageMode.HINDI
-            )
-        } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Web research timed out", e)
-            throw IllegalStateException("Web research timed out after 60 seconds. Please try again.", e)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "Web research failed", e)
-            throw e
-        }
+    private fun buildRawRetrievalFallback(
+        cleanQuery: String,
+        evidence: String,
+        notice: String
+    ): String = buildString {
+        appendLine("[$notice]")
+        appendLine()
+        appendLine("Query: $cleanQuery")
+        appendLine()
+        append(evidence)
     }
 
     private companion object {
-        const val TAG = "FridayAiRepo"
-        const val AI_TIMEOUT_MS = 60_000L
+        const val TAG = "DhirFridayAiRepo"
+        const val LOCAL_INFERENCE_TIMEOUT_MS = 120_000L
     }
 }

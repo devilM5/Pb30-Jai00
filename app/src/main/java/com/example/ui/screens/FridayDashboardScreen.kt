@@ -91,7 +91,7 @@ import com.example.ui.theme.SecurityDisclaimerBanner
 fun FridayDashboardScreen(
     operatorName: String,
     languageMode: LanguageMode,
-    selectedModel: AiModelOption = AiModelOption.FLASH_3_8,
+    selectedModel: AiModelOption = AiModelOption.DHIR_2B_BALANCED,
     activeAgent: AgentType,
     agentPromptInput: String,
     agentStreamState: UiState<String>,
@@ -101,6 +101,9 @@ fun FridayDashboardScreen(
     voiceState: VoiceUiState,
     sshState: SshConnectionState = SshConnectionState(),
     sshProfile: SshConnectionProfile = SshConnectionProfile(),
+    dhirModelState: com.example.data.model.DhirModelState = com.example.data.model.DhirModelState(),
+    syncStatus: com.example.data.model.SyncStatusState = com.example.data.model.SyncStatusState(),
+    isOfflineSession: Boolean = false,
     onSelectLanguage: (LanguageMode) -> Unit,
     onSelectModel: (AiModelOption) -> Unit = {},
     onSelectAgent: (AgentType) -> Unit,
@@ -115,6 +118,13 @@ fun FridayDashboardScreen(
     onOpenMemory: () -> Unit,
     onOpenStudioTab: (StudioToolTab) -> Unit = {},
     onOpenRemoteSettings: () -> Unit = {},
+    onImportDhirModel: (android.net.Uri) -> Unit = {},
+    onDownloadDhirModel: () -> Unit = {},
+    onCancelDhirDownload: () -> Unit = {},
+    onLoadDhirModel: () -> Unit = {},
+    onUnloadDhirModel: () -> Unit = {},
+    onDeleteDhirModel: () -> Unit = {},
+    onSyncNow: () -> Unit = {},
     onSignOut: () -> Unit
 ) {
     val notesCount = (notesState as? UiState.Success)?.data?.size ?: 0
@@ -228,6 +238,12 @@ fun FridayDashboardScreen(
                             sshState = sshState,
                             onClick = onOpenRemoteSettings
                         )
+                        Spacer(Modifier.height(8.dp))
+                        DashboardSyncStatusBar(
+                            syncStatus = syncStatus,
+                            isOfflineSession = isOfflineSession,
+                            onSyncClick = onSyncNow
+                        )
                     }
                 }
             }
@@ -275,6 +291,15 @@ fun FridayDashboardScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
+                )
+                com.example.ui.theme.DhirModelStatusCard(
+                    modelState = dhirModelState,
+                    onImportModelUri = onImportDhirModel,
+                    onDownloadOfficialModel = onDownloadDhirModel,
+                    onCancelDownload = onCancelDhirDownload,
+                    onLoadModel = onLoadDhirModel,
+                    onUnloadModel = onUnloadDhirModel,
+                    onDeleteModel = onDeleteDhirModel
                 )
             }
         }
@@ -547,4 +572,48 @@ private fun agentIcon(agent: AgentType): ImageVector = when (agent) {
     AgentType.CODE_ANALYSIS -> Icons.Default.Code
     AgentType.REPORT_ANALYSIS -> Icons.Default.Analytics
     else -> Icons.Default.Psychology
+}
+
+@Composable
+private fun DashboardSyncStatusBar(
+    syncStatus: com.example.data.model.SyncStatusState,
+    isOfflineSession: Boolean,
+    onSyncClick: () -> Unit
+) {
+    val label = when {
+        isOfflineSession -> "ROOM LOCAL-ONLY"
+        syncStatus.isSyncing -> "SYNCING…"
+        syncStatus.isOnline && syncStatus.pendingChangesCount == 0 -> "ROOM + CLOUD SYNCED"
+        syncStatus.pendingChangesCount > 0 -> "OFFLINE QUEUE (${syncStatus.pendingChangesCount})"
+        else -> "LOCAL VAULT READY"
+    }
+    val accent = if (syncStatus.isOnline && !isOfflineSession) CyberEmerald else CyberAmber
+    Surface(
+        onClick = onSyncClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("dashboard_sync_status_bar"),
+        shape = RoundedCornerShape(10.dp),
+        color = Color.Black.copy(alpha = 0.65f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = syncStatus.lastSyncSummary,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(8.dp))
+            CyberTagBadge(text = if (isOfflineSession) "SIGN IN" else label, accentColor = accent)
+        }
+    }
 }

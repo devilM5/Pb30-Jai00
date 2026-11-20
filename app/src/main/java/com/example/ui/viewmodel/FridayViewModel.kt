@@ -5,9 +5,11 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.ai.DhirModelManager
 import com.example.core.CommandPolicyValidator
 import com.example.core.CredentialRedactor
 import com.example.core.FridayCommandRouter
+import com.example.core.FridayToolOrchestrator
 import com.example.core.ProjectFileHelper
 import com.example.core.QuickCommandStore
 import com.example.core.SecureSshCredentialStore
@@ -19,6 +21,7 @@ import com.example.data.model.BridgeExecutionResult
 import com.example.data.model.ChatMessage
 import com.example.data.model.CodeLanguage
 import com.example.data.model.ConversationalAction
+import com.example.data.model.DhirModelState
 import com.example.data.model.LanguageMode
 import com.example.data.model.LearningNote
 import com.example.data.model.LoadedProjectFile
@@ -28,12 +31,15 @@ import com.example.data.model.ProposedFilePatch
 import com.example.data.model.QuickCommandItem
 import com.example.data.model.SshConnectionProfile
 import com.example.data.model.SshConnectionState
+import com.example.data.model.SyncStatusState
 import com.example.data.model.TerminalEnvironment
 import com.example.data.model.TerminalExecutionStatus
 import com.example.data.model.TerminalLog
 import com.example.data.model.TermuxConnectionMode
 import com.example.data.model.TermuxEnvironmentState
+import com.example.data.model.ToolExecutionTrace
 import com.example.data.model.UiState
+import com.example.data.model.WebCitation
 import com.example.data.model.WebResearchResult
 import com.example.data.repository.FridayAiRepository
 import com.example.data.repository.MemoryRepository
@@ -41,7 +47,6 @@ import com.example.data.repository.SshRemoteExecutor
 import com.example.data.repository.TerminalBridgeClient
 import com.example.data.repository.TermuxCompanionClient
 import com.example.data.repository.ToolAvailabilityParser
-import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -65,19 +70,17 @@ class FridayViewModel(
     private val termuxClient: TermuxCompanionClient? = null,
     private val sshExecutor: SshRemoteExecutor? = null,
     private val sshCredentialStore: SecureSshCredentialStore? = null,
-    private val quickCommandStore: QuickCommandStore? = null
+    private val quickCommandStore: QuickCommandStore? = null,
+    private val dhirModelManager: DhirModelManager? = null,
+    private val toolOrchestrator: FridayToolOrchestrator? = null
 ) : ViewModel() {
 
     private fun <T> Flow<List<T>>.toUiStateFlow(errorLabel: String): StateFlow<UiState<List<T>>> =
         map<List<T>, UiState<List<T>>> { UiState.Success(it) }
             .catch { error ->
-                val firestoreError = generateSequence(error) { it.cause }
-                    .filterIsInstance<FirebaseFirestoreException>()
-                    .firstOrNull()
-                if (firestoreError == null && error is CancellationException) throw error
-                val root = firestoreError ?: error
-                Log.w(TAG, errorLabel, root)
-                emit(UiState.Error(root.message ?: errorLabel))
+                if (error is CancellationException) throw error
+                Log.w(TAG, errorLabel, error)
+                emit(UiState.Error(error.message ?: errorLabel))
             }
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS), UiState.Loading)
 
@@ -99,16 +102,35 @@ class FridayViewModel(
         memoryRepository.observeTerminalLogs(currentUserId)
             .toUiStateFlow("Failed to load terminal logs.")
 
+    val checkedChecklistIds: StateFlow<Set<String>> =
+        memoryRepository.observeCompletedChecklistIds(currentUserId)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS), emptySet())
+
+    val completedQuizModuleIds: StateFlow<Set<String>> =
+        memoryRepository.observeCompletedQuizModuleIds(currentUserId)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS), emptySet())
+
+    val syncStatus: StateFlow<SyncStatusState> = memoryRepository.syncStatus
+
+    val dhirModelState: StateFlow<DhirModelState> =
+        dhirModelManager?.state ?: MutableStateFlow(DhirModelState()).asStateFlow()
+
     val voiceState: StateFlow<VoiceUiState> = voiceController.state
 
     private val _languageMode = MutableStateFlow(LanguageMode.HINGLISH)
     val languageMode: StateFlow<LanguageMode> = _languageMode.asStateFlow()
 
-    private val _selectedModel = MutableStateFlow(AiModelOption.FLASH_3_8)
+    private val _selectedModel = MutableStateFlow(AiModelOption.DHIR_2B_BALANCED)
     val selectedModel: StateFlow<AiModelOption> = _selectedModel.asStateFlow()
 
     private val _chatStreamState = MutableStateFlow<UiState<String>>(UiState.Idle)
     val chatStreamState: StateFlow<UiState<String>> = _chatStreamState.asStateFlow()
+
+    private val _latestToolTraces = MutableStateFlow<List<ToolExecutionTrace>>(emptyList())
+    val latestToolTraces: StateFlow<List<ToolExecutionTrace>> = _latestToolTraces.asStateFlow()
+
+    private val _latestChatCitations = MutableStateFlow<List<WebCitation>>(emptyList())
+    val latestChatCitations: StateFlow<List<WebCitation>> = _latestChatCitations.asStateFlow()
 
     private val _pendingChatAction = MutableStateFlow<ConversationalAction>(ConversationalAction.None)
     val pendingChatAction: StateFlow<ConversationalAction> = _pendingChatAction.asStateFlow()
@@ -185,12 +207,6 @@ class FridayViewModel(
     private val _proposedFilePatch = MutableStateFlow<ProposedFilePatch?>(null)
     val proposedFilePatch: StateFlow<ProposedFilePatch?> = _proposedFilePatch.asStateFlow()
 
-    private val _checkedChecklistIds = MutableStateFlow<Set<String>>(emptySet())
-    val checkedChecklistIds: StateFlow<Set<String>> = _checkedChecklistIds.asStateFlow()
-
-    private val _completedQuizModuleIds = MutableStateFlow<Set<String>>(emptySet())
-    val completedQuizModuleIds: StateFlow<Set<String>> = _completedQuizModuleIds.asStateFlow()
-
     private val _memorySearchQuery = MutableStateFlow("")
     val memorySearchQuery: StateFlow<String> = _memorySearchQuery.asStateFlow()
 
@@ -204,6 +220,7 @@ class FridayViewModel(
     private var researchJob: Job? = null
     private var fileJob: Job? = null
     private var activeCommandJob: Job? = null
+    private var modelTransferJob: Job? = null
 
     fun setLanguageMode(mode: LanguageMode) { _languageMode.value = mode }
     fun setSelectedModel(option: AiModelOption) { _selectedModel.value = option }
@@ -213,15 +230,81 @@ class FridayViewModel(
     fun clearStatusBanner() { _statusBanner.value = null }
     fun dismissChatAction() { _pendingChatAction.value = ConversationalAction.None }
 
+    // --- Local Dhīr 2B Model Lifecycle ---
+    fun importDhirModelUri(uri: Uri) {
+        val manager = dhirModelManager ?: return
+        modelTransferJob?.cancel()
+        modelTransferJob = viewModelScope.launch {
+            val res = manager.importFromUri(uri)
+            _statusBanner.value = if (res.isSuccess) {
+                "Imported ${res.getOrThrow().name} safely into local vault."
+            } else {
+                res.exceptionOrNull()?.localizedMessage ?: "GGUF import failed."
+            }
+        }
+    }
+
+    fun downloadDhirModel() {
+        val manager = dhirModelManager ?: return
+        modelTransferJob?.cancel()
+        modelTransferJob = viewModelScope.launch {
+            val res = manager.downloadOfficialDhirModel()
+            _statusBanner.value = if (res.isSuccess) {
+                "Downloaded ${res.getOrThrow().name}. Tap Load RAM to activate."
+            } else {
+                res.exceptionOrNull()?.localizedMessage ?: "Model download failed."
+            }
+        }
+    }
+
+    fun cancelDhirModelDownload() {
+        dhirModelManager?.cancelDownload()
+        modelTransferJob?.cancel()
+    }
+
+    fun loadDhirModel() {
+        viewModelScope.launch {
+            val res = aiRepository.ensureDhirLoaded(_selectedModel.value)
+            _statusBanner.value = if (res.isSuccess) {
+                "Dhīr 2B loaded on-device for offline inference."
+            } else {
+                res.exceptionOrNull()?.localizedMessage ?: "Failed to load Dhīr 2B."
+            }
+        }
+    }
+
+    fun unloadDhirModel() {
+        aiRepository.unloadDhir()
+        _statusBanner.value = "Dhīr 2B unloaded from RAM."
+    }
+
+    fun deleteDhirModel() {
+        aiRepository.unloadDhir()
+        val deleted = dhirModelManager?.deleteInstalledModel() ?: false
+        _statusBanner.value = if (deleted) "Stored GGUF model deleted." else "Could not remove GGUF file."
+    }
+
+    fun syncCloudNow() {
+        viewModelScope.launch {
+            memoryRepository.syncPendingChanges(currentUserId)
+            _statusBanner.value = memoryRepository.syncStatus.value.lastSyncSummary
+        }
+    }
+
+    // --- Learning Records (Persisted in Room) ---
     fun toggleChecklistItem(itemId: String) {
-        val current = _checkedChecklistIds.value
-        _checkedChecklistIds.value = if (itemId in current) current - itemId else current + itemId
+        viewModelScope.launch {
+            memoryRepository.toggleChecklistItem(currentUserId, itemId)
+        }
     }
 
     fun markQuizCompleted(moduleId: String) {
-        _completedQuizModuleIds.value = _completedQuizModuleIds.value + moduleId
+        viewModelScope.launch {
+            memoryRepository.markQuizCompleted(currentUserId, moduleId)
+        }
     }
 
+    // --- Unified Conversational AI & Orchestrator ---
     fun sendChatPrompt(rawPrompt: String, autoSpeakResponse: Boolean = false) {
         val prompt = rawPrompt.trim()
         if (prompt.isEmpty()) return
@@ -245,27 +328,46 @@ class FridayViewModel(
         chatJob = viewModelScope.launch {
             val currentMessages = (chatHistoryState.value as? UiState.Success)?.data.orEmpty()
             val historyPairs = currentMessages.filter { it.agentType == AgentType.CHAT.name }
-                .takeLast(16).map { it.role to it.content }
+                .takeLast(12).map { it.role to it.content }
 
             _chatStreamState.value = UiState.Loading
-            if (memoryRepository.saveChatMessage("USER", prompt, effectiveLanguage, AgentType.CHAT).isFailure) {
-                _statusBanner.value = "Could not sync user message to cloud history."
-            }
+            _latestToolTraces.value = emptyList()
+            _latestChatCitations.value = emptyList()
+
+            memoryRepository.saveChatMessage("USER", prompt, effectiveLanguage, AgentType.CHAT, currentUserId)
 
             var latestText = ""
             try {
-                aiRepository.streamResponse(
-                    prompt = prompt,
-                    languageMode = effectiveLanguage,
-                    agentType = AgentType.CHAT,
-                    modelOption = _selectedModel.value,
-                    history = historyPairs
-                ).collect { partial ->
-                    latestText = partial
-                    _chatStreamState.value = UiState.Streaming(partial)
+                val orchestrator = toolOrchestrator
+                if (orchestrator != null) {
+                    orchestrator.orchestrateChatTurn(
+                        userPrompt = prompt,
+                        languageMode = effectiveLanguage,
+                        modelOption = _selectedModel.value,
+                        history = historyPairs
+                    ).collect { chunk ->
+                        latestText = chunk.streamingText
+                        _latestToolTraces.value = chunk.toolTraces
+                        _latestChatCitations.value = chunk.citations
+                        if (latestText.isNotBlank()) {
+                            _chatStreamState.value = UiState.Streaming(latestText)
+                        }
+                    }
+                } else {
+                    aiRepository.streamResponse(
+                        prompt = prompt,
+                        languageMode = effectiveLanguage,
+                        agentType = AgentType.CHAT,
+                        modelOption = _selectedModel.value,
+                        history = historyPairs
+                    ).collect { partial ->
+                        latestText = partial
+                        _chatStreamState.value = UiState.Streaming(partial)
+                    }
                 }
+
                 if (latestText.isNotBlank()) {
-                    memoryRepository.saveChatMessage("FRIDAY", latestText, effectiveLanguage, AgentType.CHAT)
+                    memoryRepository.saveChatMessage("FRIDAY", latestText, effectiveLanguage, AgentType.CHAT, currentUserId)
                     _chatStreamState.value = UiState.Idle
                     if (autoSpeakResponse) speakText(latestText, id = "latest_friday_reply")
                 } else {
@@ -296,8 +398,8 @@ class FridayViewModel(
                 }
                 if (latestText.isNotBlank()) {
                     _agentStreamState.value = UiState.Success(latestText)
-                    memoryRepository.saveChatMessage("USER", "[${agent.title}] $input", mode, agent)
-                    memoryRepository.saveChatMessage("FRIDAY", latestText, mode, agent)
+                    memoryRepository.saveChatMessage("USER", "[${agent.title}] $input", mode, agent, currentUserId)
+                    memoryRepository.saveChatMessage("FRIDAY", latestText, mode, agent, currentUserId)
                 } else {
                     _agentStreamState.value = UiState.Error("Agent returned an empty response.")
                 }
@@ -396,7 +498,8 @@ class FridayViewModel(
                 status = result.status,
                 output = CredentialRedactor.redactWithSecrets(summary, runtimeSecrets()),
                 exitCode = result.exitCode,
-                approvedByUser = true
+                approvedByUser = true,
+                userIdOverride = currentUserId
             )
         }
     }
@@ -630,7 +733,8 @@ class FridayViewModel(
                     status = TerminalExecutionStatus.BLOCKED,
                     output = CredentialRedactor.redactWithSecrets(evaluated.reason, secrets),
                     exitCode = -1,
-                    approvedByUser = false
+                    approvedByUser = false,
+                    userIdOverride = currentUserId
                 )
             }
         }
@@ -648,7 +752,8 @@ class FridayViewModel(
                     status = TerminalExecutionStatus.CANCELLED,
                     output = "Cancelled explicitly by operator prior to execution.",
                     exitCode = -1,
-                    approvedByUser = false
+                    approvedByUser = false,
+                    userIdOverride = currentUserId
                 )
             }
         }
@@ -728,7 +833,8 @@ class FridayViewModel(
                     status = res.status,
                     output = CredentialRedactor.redactWithSecrets(combinedOutput, secrets),
                     exitCode = res.exitCode,
-                    approvedByUser = true
+                    approvedByUser = true,
+                    userIdOverride = currentUserId
                 )
             } catch (cancel: CancellationException) {
                 val cancelledResult = BridgeExecutionResult(
@@ -748,7 +854,8 @@ class FridayViewModel(
                         status = TerminalExecutionStatus.CANCELLED,
                         output = "Active execution cancelled by operator.",
                         exitCode = -1,
-                        approvedByUser = true
+                        approvedByUser = true,
+                        userIdOverride = currentUserId
                     )
                 }
                 throw cancel
@@ -871,7 +978,7 @@ class FridayViewModel(
     // --- Memory & Voice ---
     fun saveNote(title: String, content: String, category: NoteCategory, pinned: Boolean = false) {
         viewModelScope.launch {
-            val result = memoryRepository.saveNote(title, content, category, pinned)
+            val result = memoryRepository.saveNote(title, content, category, pinned, currentUserId)
             _statusBanner.value = if (result.isSuccess) "Saved to FRIDAY Memory."
             else result.exceptionOrNull()?.localizedMessage ?: "Failed to save note."
         }
@@ -879,7 +986,7 @@ class FridayViewModel(
 
     fun updateNote(noteId: String, title: String, content: String, category: NoteCategory, pinned: Boolean) {
         viewModelScope.launch {
-            val result = memoryRepository.updateNote(noteId, title, content, category, pinned)
+            val result = memoryRepository.updateNote(noteId, title, content, category, pinned, currentUserId)
             _statusBanner.value = if (result.isSuccess) "Memory note updated."
             else result.exceptionOrNull()?.localizedMessage ?: "Failed to update note."
         }
@@ -887,14 +994,14 @@ class FridayViewModel(
 
     fun togglePin(note: LearningNote) {
         viewModelScope.launch {
-            val result = memoryRepository.togglePin(note.id, note.pinned)
+            val result = memoryRepository.togglePin(note.id, note.pinned, currentUserId)
             if (result.isFailure) _statusBanner.value = result.exceptionOrNull()?.localizedMessage ?: "Failed to update pin."
         }
     }
 
     fun deleteNote(noteId: String) {
         viewModelScope.launch {
-            val result = memoryRepository.deleteNote(noteId)
+            val result = memoryRepository.deleteNote(noteId, currentUserId)
             _statusBanner.value = if (result.isSuccess) "Note deleted."
             else result.exceptionOrNull()?.localizedMessage ?: "Failed to delete note."
         }
@@ -902,7 +1009,7 @@ class FridayViewModel(
 
     fun deleteChatMessage(messageId: String) {
         viewModelScope.launch {
-            val result = memoryRepository.deleteChatMessage(messageId)
+            val result = memoryRepository.deleteChatMessage(messageId, currentUserId)
             if (result.isFailure) _statusBanner.value = result.exceptionOrNull()?.localizedMessage ?: "Failed to delete message."
         }
     }
@@ -911,7 +1018,7 @@ class FridayViewModel(
         val messages = (chatHistoryState.value as? UiState.Success)?.data.orEmpty()
         if (messages.isEmpty()) return
         viewModelScope.launch {
-            val result = memoryRepository.clearChatHistory(messages)
+            val result = memoryRepository.clearChatHistory(messages, currentUserId)
             _statusBanner.value = if (result.isSuccess) "Conversation history cleared."
             else result.exceptionOrNull()?.localizedMessage ?: "Failed to clear history."
         }
@@ -934,6 +1041,7 @@ class FridayViewModel(
     override fun onCleared() {
         super.onCleared()
         sshExecutor?.abortRunningChannel()
+        aiRepository.abortGeneration()
         voiceController.release()
     }
 

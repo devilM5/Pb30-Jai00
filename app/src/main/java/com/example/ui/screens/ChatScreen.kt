@@ -93,6 +93,9 @@ fun ChatScreen(
     pendingAction: ConversationalAction,
     voiceState: VoiceUiState,
     prefillPrompt: String?,
+    toolTraces: List<com.example.data.model.ToolExecutionTrace> = emptyList(),
+    latestCitations: List<com.example.data.model.WebCitation> = emptyList(),
+    dhirModelState: com.example.data.model.DhirModelState? = null,
     onConsumePrefill: () -> Unit,
     onSelectLanguage: (LanguageMode) -> Unit,
     onSelectModel: (AiModelOption) -> Unit,
@@ -178,7 +181,9 @@ fun ChatScreen(
                             )
                             Text(
                                 text = "${selectedModel.displayName} • ${
-                                    if (voiceState.hindiTtsAvailable) "hi-IN Voice Ready" else "Voice Ready"
+                                    dhirModelState?.status?.label ?: "Local"
+                                } • ${
+                                    if (voiceState.hindiTtsAvailable) "hi-IN Voice" else "Voice"
                                 }",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -391,6 +396,50 @@ fun ChatScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.primary
                         )
+                    }
+                }
+            }
+
+            if (toolTraces.isNotEmpty() || latestCitations.isNotEmpty()) {
+                item {
+                    CyberHudCard(
+                        modifier = Modifier.fillMaxWidth().testTag("chat_orchestrator_traces_card"),
+                        accentColor = com.example.ui.theme.CyberEmerald
+                    ) {
+                        if (toolTraces.isNotEmpty()) {
+                            CyberTagBadge(text = "ORCHESTRATOR TOOLS (${toolTraces.size})", accentColor = com.example.ui.theme.CyberEmerald)
+                            Spacer(Modifier.height(6.dp))
+                            toolTraces.forEach { trace ->
+                                Text(
+                                    text = "• ${trace.toolName}: ${trace.summary}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        if (latestCitations.isNotEmpty()) {
+                            Spacer(Modifier.height(6.dp))
+                            Text("SOURCES", style = MaterialTheme.typography.labelSmall, color = NeonCyan)
+                            latestCitations.forEach { cite ->
+                                Text(
+                                    text = "• ${cite.title} (${cite.url})",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = NeonCyan,
+                                    modifier = Modifier
+                                        .clickable {
+                                            runCatching {
+                                                context.startActivity(
+                                                    android.content.Intent(
+                                                        android.content.Intent.ACTION_VIEW,
+                                                        android.net.Uri.parse(cite.url)
+                                                    )
+                                                )
+                                            }
+                                        }
+                                        .padding(vertical = 2.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }

@@ -53,6 +53,16 @@ import com.example.data.model.UiState
 import com.example.data.repository.SshRemoteExecutor
 import com.example.data.repository.TermuxCompanionClient
 import com.example.data.repository.ToolAvailabilityParser
+import androidx.room.Room
+import com.example.ai.DhirModelManager
+import com.example.ai.DhirPromptFormatter
+import com.example.ai.DhirTurn
+import com.example.core.FridayToolOrchestrator
+import com.example.data.local.FridayDatabase
+import com.example.data.model.NoteCategory
+import com.example.data.repository.FridayAiRepository
+import com.example.data.repository.MemoryRepository
+import com.example.data.repository.WebToolsRepository
 import com.example.ui.MainLayout
 import com.example.ui.ROUTE_CHAT
 import com.example.ui.ROUTE_DASHBOARD
@@ -70,7 +80,15 @@ import com.example.ui.screens.TerminalAgentTab
 import com.example.ui.screens.ToolsStudioScreen
 import com.example.ui.screens.filterTerminalLogs
 import com.example.ui.theme.FridaySecurityTheme
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -336,7 +354,7 @@ class FridaySecurityRobolectricTest {
         composeRule.setContent {
             FridaySecurityTheme {
                 var selectedTab by remember { mutableStateOf(StudioToolTab.CODING) }
-                var model by remember { mutableStateOf(AiModelOption.FLASH_3_8) }
+                var model by remember { mutableStateOf(AiModelOption.DHIR_2B_BALANCED) }
                 var execEnv by remember { mutableStateOf(TerminalEnvironment.TERMUX_BRIDGE) }
                 var timeout by remember { mutableStateOf(30) }
                 ToolsStudioScreen(
@@ -506,7 +524,7 @@ class FridaySecurityRobolectricTest {
                 FridayDashboardScreen(
                     operatorName = "PB-30 JAI",
                     languageMode = LanguageMode.HINGLISH,
-                    selectedModel = AiModelOption.FLASH_3_8,
+                    selectedModel = AiModelOption.DHIR_2B_BALANCED,
                     activeAgent = selectedAgent,
                     agentPromptInput = "",
                     agentStreamState = UiState.Idle,
@@ -548,7 +566,7 @@ class FridaySecurityRobolectricTest {
                 FridayDashboardScreen(
                     operatorName = "PB-30 JAI",
                     languageMode = LanguageMode.HINGLISH,
-                    selectedModel = AiModelOption.FLASH_3_8,
+                    selectedModel = AiModelOption.DHIR_2B_BALANCED,
                     activeAgent = AgentType.RESEARCH,
                     agentPromptInput = "",
                     agentStreamState = UiState.Idle,
@@ -826,5 +844,236 @@ class FridaySecurityRobolectricTest {
         composeRule.onNodeWithTag("biometric_fallback_bypass_button").performScrollTo().performClick()
         composeRule.waitForIdle()
         assertTrue(unlocked)
+    }
+
+    @Test
+    fun dhirPromptFormatterBuildsV5NothinkPromptAndParsesToolCalls() {
+        val toolsJson = DhirPromptFormatter.buildToolDeclarationsJson()
+        val prompt = DhirPromptFormatter.formatPrompt(
+            systemPrompt = "You are FRIDAY.",
+            turns = listOf(
+                DhirTurn("user", "नमस्ते FRIDAY, OWASP समझाइए"),
+                DhirTurn("assistant", "नमस्ते! OWASP Top 10 वेब सुरक्षा जोखिमों की सूची है।"),
+                DhirTurn("observation", "Web hit: OWASP 2021")
+            ),
+            toolsJson = toolsJson
+        )
+
+        assertTrue(prompt.startsWith("<bos><|system|>You are FRIDAY.<|tool_declare|><tools>"))
+        assertTrue(prompt.contains("<|user|>नमस्ते FRIDAY, OWASP समझाइए<|end_of_turn|>"))
+        assertTrue(prompt.contains("<|assistant|><|nothink|>नमस्ते! OWASP Top 10"))
+        assertTrue(prompt.contains("<|observation|><tool_response>Web hit: OWASP 2021</tool_response><|end_of_turn|>"))
+        assertTrue(prompt.endsWith("<|assistant|><|nothink|>"))
+
+        val rawModelOutput = """
+            <|nothink|>मैं अभी CVE खोज रहा हूँ।
+            <tool_call>{"name":"web_search","arguments":{"query":"CVE-2024-3094"}}</tool_call>
+            <|end_of_turn|>
+        """.trimIndent()
+        val calls = DhirPromptFormatter.parseToolCalls(rawModelOutput)
+        assertEquals(1, calls.size)
+        assertEquals("web_search", calls.first().name)
+        assertEquals("CVE-2024-3094", calls.first().arguments["query"])
+
+        val cleaned = DhirPromptFormatter.cleanVisibleText(rawModelOutput)
+        assertEquals("मैं अभी CVE खोज रहा हूँ।", cleaned)
+    }
+
+    @Test
+    fun dhirModelManagerValidatesGgufMagicAndRamContextBudget() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val tempDir = File(context.cacheDir, "gguf_test_${System.currentTimeMillis()}").apply { mkdirs() }
+        try {
+            val validFile = File(tempDir, "dhir-2b-Q4_K_M.gguf")
+            RandomAccessFile(validFile, "rw").use { raf ->
+                raf.setLength(1200L * 1024L)
+                val header = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(0x46554747) // 'G','G','U','F'
+                    .putInt(3)          // GGUF v3
+                    .array()
+                raf.seek(0)
+                raf.write(header)
+            }
+            val validCheck = DhirModelManager.validateGgufFile(validFile)
+            assertTrue(validCheck.isValid)
+            assertEquals(3, validCheck.ggufVersion)
+
+            val corruptFile = File(tempDir, "bad-dhir.gguf")
+            RandomAccessFile(corruptFile, "rw").use { raf ->
+                raf.setLength(1200L * 1024L)
+                raf.seek(0)
+                raf.write("NOTGGUF!".toByteArray())
+            }
+            val corruptCheck = DhirModelManager.validateGgufFile(corruptFile)
+            assertFalse(corruptCheck.isValid)
+
+            assertEquals(1536, DhirModelManager.recommendContextSize(totalRamMb = 2048))
+            assertEquals(2048, DhirModelManager.recommendContextSize(totalRamMb = 4096))
+            assertEquals(4096, DhirModelManager.recommendContextSize(totalRamMb = 8192))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun webToolsRepositoryParsesDuckDuckGoYouTubeTranscriptAndBlocksSsrf() {
+        val repo = WebToolsRepository()
+
+        val ddgHtml = """
+            <div class="result">
+              <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fowasp.org%2Fwww-project-top-ten%2F">OWASP Top Ten</a>
+              <a class="result__snippet">Official OWASP security standard documentation.</a>
+            </div>
+        """.trimIndent()
+        val hits = repo.parseDuckDuckGoHtml(ddgHtml)
+        assertEquals(1, hits.size)
+        assertEquals("https://owasp.org/www-project-top-ten/", hits.first().url)
+        assertEquals("OWASP Top Ten", hits.first().title)
+
+        val ytHtml = """
+            <script>var ytInitialData = {"contents":{"sectionListRenderer":{"itemSectionRenderer":{"videoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"runs":[{"text":"Nmap Ethical Lab Walkthrough"}]},"ownerText":{"runs":[{"text":"SecLab"}]},"lengthText":{"simpleText":"12:34"}}}}}};</script>
+        """.trimIndent()
+        val videos = repo.parseYouTubeSearchHtml(ytHtml)
+        assertEquals(1, videos.size)
+        assertEquals("dQw4w9WgXcQ", videos.first().videoId)
+        assertEquals("Nmap Ethical Lab Walkthrough", videos.first().title)
+        assertEquals("SecLab", videos.first().channel)
+
+        val transcriptXml = """<transcript><text start="0.0">Namaste &amp; welcome to</text><text start="2.0">authorized security testing.</text></transcript>"""
+        assertEquals("Namaste & welcome to authorized security testing.", repo.parseYouTubeTimedTextXml(transcriptXml))
+
+        assertNotNull(repo.validateSafePublicHttpUrl("http://localhost:8080/admin"))
+        assertNotNull(repo.validateSafePublicHttpUrl("http://127.0.0.1/latest"))
+        assertNotNull(repo.validateSafePublicHttpUrl("http://169.254.169.254/latest/meta-data"))
+        assertNotNull(repo.validateSafePublicHttpUrl("http://192.168.1.1/"))
+        assertEquals(null, repo.validateSafePublicHttpUrl("https://nvd.nist.gov/vuln"))
+    }
+
+    @Test
+    fun roomMemoryRepositoryPersistsNotesChatLearningRecordsAndLocalOnlyTerminalLogs() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, FridayDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val repo = MemoryRepository(dao = db.fridayDao(), db = null, auth = null, context = context)
+            val uid = MemoryRepository.LOCAL_OFFLINE_USER_ID
+
+            val saveRes = repo.saveNote(
+                title = "Nmap Verification Brief",
+                content = "Checked port 22 on authorized lab host using token=secret_abc123",
+                category = NoteCategory.LAB_REPORT,
+                userIdOverride = uid
+            )
+            assertTrue(saveRes.isSuccess)
+            val notes = repo.observeNotes(uid).first()
+            assertEquals(1, notes.size)
+            assertTrue(notes.first().id.matches(Regex("^[a-zA-Z0-9_\\-]+$")))
+            assertFalse(notes.first().content.contains("secret_abc123"))
+
+            repo.saveChatMessage("USER", "Hinglish mein Nmap flags batao", LanguageMode.HINGLISH, AgentType.CHAT, uid)
+            repo.saveChatMessage("FRIDAY", "-sV service version detection ke liye hota hai.", LanguageMode.HINGLISH, AgentType.CHAT, uid)
+            val chats = repo.observeChatMessages(uid).first()
+            assertEquals(2, chats.size)
+
+            repo.toggleChecklistItem(uid, "w1")
+            repo.markQuizCompleted(uid, "networking")
+            assertTrue("w1" in repo.observeCompletedChecklistIds(uid).first())
+            assertTrue("networking" in repo.observeCompletedQuizModuleIds(uid).first())
+
+            repo.saveTerminalLog(
+                command = "sshpass -p MyPass99 ssh kali@10.0.0.5",
+                environment = TerminalEnvironment.LINUX_SERVER_BRIDGE,
+                status = TerminalExecutionStatus.EXECUTED,
+                output = "Linux kali 6.6",
+                exitCode = 0,
+                approvedByUser = true,
+                userIdOverride = uid
+            )
+            val logEntities = db.fridayDao().observeTerminalLogs(uid).first()
+            assertEquals(1, logEntities.size)
+            assertTrue(logEntities.first().localOnly)
+
+            val searchHit = repo.searchLocalKnowledge(uid, "Nmap")
+            assertTrue(searchHit.contains("Nmap Verification Brief"))
+            assertTrue(searchHit.contains("-sV service version"))
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun fridayToolOrchestratorStagesTerminalCommandsThroughApprovalGateAndHandlesOfflineModelState() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, FridayDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val uid = MemoryRepository.LOCAL_OFFLINE_USER_ID
+            val memoryRepo = MemoryRepository(dao = db.fridayDao(), db = null, auth = null, context = context)
+            memoryRepo.saveNote("SQLi Prevention", "Use parameterized queries to mitigate SQL injection.", NoteCategory.CYBERSECURITY, userIdOverride = uid)
+
+            val webRepo = WebToolsRepository()
+            val stagedCommands = mutableListOf<String>()
+            val stubAiRepo = object : FridayAiRepository {
+                override fun streamResponse(
+                    prompt: String,
+                    languageMode: LanguageMode,
+                    agentType: AgentType,
+                    modelOption: AiModelOption,
+                    history: List<Pair<String, String>>,
+                    toolsJson: String?
+                ): Flow<String> = flow {
+                    emit("Prepared command proposal.")
+                }
+            }
+
+            // 1. Test tool call routing & mandatory CommandApprovalDialog staging
+            val orchestrator = FridayToolOrchestrator(
+                aiRepository = stubAiRepo,
+                memoryRepository = memoryRepo,
+                webToolsRepository = webRepo,
+                modelManager = null,
+                currentUserId = uid,
+                termuxStateProvider = { TermuxEnvironmentState() },
+                sshProfileProvider = { SshConnectionProfile(host = "10.0.0.9", username = "sec") },
+                sshStateProvider = { SshConnectionState() },
+                onStageTerminalApproval = { stagedCommands += it }
+            )
+
+            val traces = mutableListOf<com.example.data.model.ToolExecutionTrace>()
+            val cites = mutableListOf<com.example.data.model.WebCitation>()
+            val prepMsg = orchestrator.executeToolCallSafely(
+                call = com.example.ai.ParsedToolCall("prepare_terminal_command", mapOf("command" to "nmap -sV 127.0.0.1")),
+                traces = traces,
+                citations = cites
+            )
+            assertEquals(listOf("nmap -sV 127.0.0.1"), stagedCommands)
+            assertTrue(prepMsg.contains("approval dialog", ignoreCase = true))
+
+            val envStatus = orchestrator.executeToolCallSafely(
+                call = com.example.ai.ParsedToolCall("check_environment_status", mapOf("scope" to "all")),
+                traces = traces,
+                citations = cites
+            )
+            assertTrue(envStatus.contains("Termux Bridge: DISCONNECTED"))
+            assertTrue(envStatus.contains("Remote Linux SSH: DISCONNECTED"))
+
+            // 2. Test honest missing-model response with real local memory tool execution
+            val chunks = orchestrator.orchestrateChatTurn(
+                userPrompt = "Check my saved notes for SQLi prevention",
+                languageMode = LanguageMode.ENGLISH,
+                modelOption = AiModelOption.DHIR_2B_BALANCED,
+                history = emptyList()
+            ).toList()
+
+            val finalChunk = chunks.last()
+            assertTrue(finalChunk.isFinished)
+            assertTrue(finalChunk.streamingText.contains("dhir-2b-Q4_K_M.gguf"))
+            assertTrue(finalChunk.streamingText.contains("parameterized queries"))
+            assertTrue(finalChunk.toolTraces.any { it.toolName == "search_memory" })
+        } finally {
+            db.close()
+        }
     }
 }

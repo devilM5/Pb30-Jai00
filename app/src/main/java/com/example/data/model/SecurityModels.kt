@@ -21,32 +21,94 @@ enum class AiModelOption(
     val modelId: String,
     val displayName: String,
     val tierBadge: String,
-    val description: String
+    val description: String,
+    val contextSize: Int,
+    val maxTokens: Int,
+    val temperature: Float
 ) {
-    FLASH_3_8(
-        modelId = "gemini-3.8-flash",
-        displayName = "Gemini 3.8 Flash",
-        tierBadge = "DEFAULT",
-        description = "Fast, balanced multimodal reasoning & coding"
+    DHIR_2B_BALANCED(
+        modelId = "dhir-2b-Q4_K_M.gguf",
+        displayName = "Dhīr 2B • Balanced",
+        tierBadge = "LOCAL Q4_K_M",
+        description = "On-device Dhīr 2B GGUF (llama.cpp • 4K ctx • balanced)",
+        contextSize = 4096,
+        maxTokens = 768,
+        temperature = 0.35f
     ),
-    FLASH_LITE_3_5(
-        modelId = "gemini-3.5-flash-lite",
-        displayName = "Gemini 3.5 Lite",
-        tierBadge = "ULTRA FAST",
-        description = "Low-latency replies for quick chats & summaries"
+    DHIR_2B_FAST(
+        modelId = "dhir-2b-Q4_K_M.gguf#fast",
+        displayName = "Dhīr 2B • Fast",
+        tierBadge = "LOW RAM",
+        description = "Low-RAM fast mobile preset (2K ctx • crisp replies)",
+        contextSize = 2048,
+        maxTokens = 384,
+        temperature = 0.25f
     ),
-    ARGON_4(
-        modelId = "gemini-4-argon",
-        displayName = "Gemini 4 Argon",
-        tierBadge = "PRO REASONING",
-        description = "Deep coding, debugging & complex architecture (Blaze)"
+    DHIR_2B_DEEP(
+        modelId = "dhir-2b-Q4_K_M.gguf#deep",
+        displayName = "Dhīr 2B • Deep",
+        tierBadge = "4K RESEARCH",
+        description = "Extended reasoning & tool synthesis with Dhīr 2B",
+        contextSize = 4096,
+        maxTokens = 1024,
+        temperature = 0.45f
     );
 
     companion object {
         fun fromModelId(id: String): AiModelOption =
-            entries.firstOrNull { it.modelId == id } ?: FLASH_3_8
+            entries.firstOrNull { it.modelId == id } ?: DHIR_2B_BALANCED
     }
 }
+
+enum class DhirModelStatus(val label: String) {
+    NOT_INSTALLED("Model Missing"),
+    VALIDATING("Validating GGUF…"),
+    DOWNLOADING("Downloading GGUF…"),
+    IMPORTING("Importing GGUF…"),
+    READY_UNLOADED("GGUF Ready (Unloaded)"),
+    LOADING("Loading into RAM…"),
+    LOADED("Active in RAM"),
+    ERROR("Model Error")
+}
+
+data class DhirModelState(
+    val status: DhirModelStatus = DhirModelStatus.NOT_INSTALLED,
+    val expectedFilename: String = "dhir-2b-Q4_K_M.gguf",
+    val activeFileName: String = "",
+    val activeFilePath: String = "",
+    val fileSizeBytes: Long = 0L,
+    val downloadProgressPercent: Int = 0,
+    val detectedArchitecture: String = "",
+    val effectiveContextSize: Int = 0,
+    val totalDeviceRamMb: Long = 0L,
+    val availableDeviceRamMb: Long = 0L,
+    val nativeBackendReady: Boolean = false,
+    val statusDetail: String = "Import or download dhir-2b-Q4_K_M.gguf to enable offline on-device Dhīr 2B inference."
+)
+
+data class SyncStatusState(
+    val isOnline: Boolean = false,
+    val isSignedIn: Boolean = false,
+    val pendingChangesCount: Int = 0,
+    val isSyncing: Boolean = false,
+    val lastSyncSummary: String = "Local Room vault active."
+)
+
+data class ToolExecutionTrace(
+    val toolName: String,
+    val summary: String,
+    val sourceUrls: List<String> = emptyList()
+)
+
+data class YouTubeVideoSummary(
+    val videoId: String,
+    val title: String,
+    val channel: String,
+    val url: String,
+    val durationLabel: String = "",
+    val transcriptExcerpt: String = "",
+    val transcriptAvailable: Boolean = false
+)
 
 enum class AgentType(
     val title: String,
@@ -55,7 +117,7 @@ enum class AgentType(
 ) {
     CHAT(
         title = "FRIDAY Core Chat",
-        subtitle = "Personal AI, coding & cyber mentor",
+        subtitle = "Local Dhīr 2B AI, coding & cyber mentor",
         promptHint = "Ask anything or say \"FRIDAY, write Python code\" / \"explain in Hindi\"…"
     ),
     RESEARCH(
@@ -90,8 +152,8 @@ enum class AgentType(
     ),
     WEB_RESEARCH(
         title = "Web Research Agent",
-        subtitle = "Live Google Search & URL summaries",
-        promptHint = "Search the web or paste a https:// documentation URL…"
+        subtitle = "Live web search, URL & YouTube research",
+        promptHint = "Search the web, YouTube transcripts, or paste an https:// URL…"
     ),
     TERMINAL_REVIEW(
         title = "Terminal Agent",
@@ -411,7 +473,9 @@ data class WebResearchResult(
     val answer: String,
     val citations: List<WebCitation>,
     val searchQueriesUsed: List<String>,
-    val explainedInHindi: Boolean
+    val explainedInHindi: Boolean,
+    val youtubeResults: List<YouTubeVideoSummary> = emptyList(),
+    val modeNote: String = ""
 )
 
 sealed interface ConversationalAction {

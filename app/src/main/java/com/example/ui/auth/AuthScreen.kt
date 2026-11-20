@@ -59,7 +59,8 @@ import com.example.ui.theme.SecurityDisclaimerBanner
 
 @Composable
 fun AuthScreen(
-    onAuthSuccess: () -> Unit
+    onAuthSuccess: () -> Unit,
+    onContinueOffline: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -159,8 +160,8 @@ fun AuthScreen(
 
                     FeatureBullet(
                         icon = Icons.Default.Psychology,
-                        title = "FRIDAY AI & 4 Security Agents",
-                        subtitle = "Research, Learning, Code Review & Report Analysis via Firebase AI Logic"
+                        title = "On-Device Dhīr 2B AI & Security Agents",
+                        subtitle = "Runs dhir-2b-Q4_K_M.gguf locally via llama.cpp with tool orchestration"
                     )
                     Spacer(Modifier.height(10.dp))
                     FeatureBullet(
@@ -171,8 +172,8 @@ fun AuthScreen(
                     Spacer(Modifier.height(10.dp))
                     FeatureBullet(
                         icon = Icons.Default.Lock,
-                        title = "Zero-Trust Encrypted Memory",
-                        subtitle = "Notes and conversation history isolated to your Google UID in Firestore"
+                        title = "Local-First Room Vault + Cloud Sync",
+                        subtitle = "Offline notes & chats sync to your Google UID in Firestore when online"
                     )
                 }
 
@@ -248,8 +249,21 @@ fun AuthScreen(
                     }
                 }
 
+                if (onContinueOffline != null) {
+                    androidx.compose.material3.OutlinedButton(
+                        onClick = onContinueOffline,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("continue_offline_button"),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Text("Continue Offline (Local Vault + Dhīr 2B)")
+                    }
+                }
+
                 Text(
-                    text = "Protected by Firebase App Check & Google Identity Services",
+                    text = "Cloud Backup protected by Firebase App Check & Google Identity Services",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center

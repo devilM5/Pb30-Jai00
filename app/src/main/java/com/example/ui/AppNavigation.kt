@@ -22,18 +22,22 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.example.R
+import com.example.ai.AndroidLlamaNativeBridge
+import com.example.ai.DhirModelManager
 import com.example.core.BiometricGateController
 import com.example.core.DefaultBiometricGateController
+import com.example.core.FridayToolOrchestrator
 import com.example.core.QuickCommandStore
 import com.example.core.SecureSshCredentialStore
 import com.example.core.VoiceController
 import com.example.data.model.NoteCategory
-import com.example.data.repository.FirebaseFridayAiRepository
+import com.example.data.model.TerminalEnvironment
+import com.example.data.repository.DhirFridayAiRepository
 import com.example.data.repository.MemoryRepository
 import com.example.data.repository.SshRemoteExecutor
 import com.example.data.repository.TerminalBridgeClient
 import com.example.data.repository.TermuxCompanionClient
+import com.example.data.repository.WebToolsRepository
 import com.example.ui.auth.AuthScreen
 import com.example.ui.auth.BiometricLockScreen
 import com.example.ui.auth.signOut
@@ -51,7 +55,6 @@ import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
 import com.google.firebase.auth.auth
-import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
@@ -70,6 +73,7 @@ fun AppNavigation(
     autoPromptBiometricOnStart: Boolean = true
 ) {
     var isBiometricUnlocked by rememberSaveable { mutableStateOf(false) }
+    var allowOfflineLocalSession by rememberSaveable { mutableStateOf(false) }
 
     if (!isBiometricUnlocked) {
         BiometricLockScreen(
@@ -83,15 +87,23 @@ fun AppNavigation(
     val currentUser by auth.authStateFlow().collectAsStateWithLifecycle(initialValue = auth.currentUser)
     val user = currentUser
 
-    if (user == null) {
-        AuthScreen(onAuthSuccess = {})
+    if (user == null && !allowOfflineLocalSession) {
+        AuthScreen(
+            onAuthSuccess = { allowOfflineLocalSession = false },
+            onContinueOffline = { allowOfflineLocalSession = true }
+        )
     } else {
-        key(user.uid) {
+        val activeUserId = user?.uid ?: MemoryRepository.LOCAL_OFFLINE_USER_ID
+        val operatorLabel = user?.displayName?.takeIf { it.isNotBlank() }
+            ?: user?.email?.substringBefore("@")
+            ?: "Local Operator"
+
+        key(activeUserId) {
             AuthenticatedFridayShell(
-                currentUserId = user.uid,
-                operatorName = user.displayName?.takeIf { it.isNotBlank() }
-                    ?: user.email?.substringBefore("@")
-                    ?: "Operator",
+                currentUserId = activeUserId,
+                operatorName = operatorLabel,
+                isOfflineSession = user == null,
+                onExitOfflineToSignIn = { allowOfflineLocalSession = false },
                 onLockVault = { isBiometricUnlocked = false }
             )
         }
@@ -102,6 +114,8 @@ fun AppNavigation(
 private fun AuthenticatedFridayShell(
     currentUserId: String,
     operatorName: String,
+    isOfflineSession: Boolean = false,
+    onExitOfflineToSignIn: () -> Unit = {},
     onLockVault: () -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -115,20 +129,41 @@ private fun AuthenticatedFridayShell(
                 val app = checkNotNull(this[APPLICATION_KEY]) {
                     "APPLICATION_KEY missing from CreationExtras"
                 }
-                val databaseId = app.getString(R.string.firestore_database_id)
-                val db = FirebaseFirestore.getInstance(databaseId)
+                val memoryRepo = MemoryRepository(app)
+                val webRepo = WebToolsRepository()
+                val llamaBridge = AndroidLlamaNativeBridge()
+                val modelManager = DhirModelManager(app) { llamaBridge.isNativeLibraryAvailable() }
+                val aiRepo = DhirFridayAiRepository(modelManager, llamaBridge, webRepo)
                 val httpBridge = TerminalBridgeClient(app)
-                FridayViewModel(
-                    memoryRepository = MemoryRepository(db),
-                    aiRepository = FirebaseFridayAiRepository(),
+
+                lateinit var vmRef: FridayViewModel
+                val orchestrator = FridayToolOrchestrator(
+                    aiRepository = aiRepo,
+                    memoryRepository = memoryRepo,
+                    webToolsRepository = webRepo,
+                    modelManager = modelManager,
+                    currentUserId = currentUserId,
+                    termuxStateProvider = { vmRef.termuxState.value },
+                    sshProfileProvider = { vmRef.sshProfile.value },
+                    sshStateProvider = { vmRef.sshState.value },
+                    onStageTerminalApproval = { cmd ->
+                        vmRef.requestCommandExecution(cmd, vmRef.selectedExecutionEnv.value)
+                    }
+                )
+                vmRef = FridayViewModel(
+                    memoryRepository = memoryRepo,
+                    aiRepository = aiRepo,
                     voiceController = VoiceController(app),
                     currentUserId = currentUserId,
                     bridgeClient = httpBridge,
                     termuxClient = TermuxCompanionClient(app, httpBridge),
                     sshExecutor = SshRemoteExecutor(app),
                     sshCredentialStore = SecureSshCredentialStore(app),
-                    quickCommandStore = QuickCommandStore(app)
+                    quickCommandStore = QuickCommandStore(app),
+                    dhirModelManager = modelManager,
+                    toolOrchestrator = orchestrator
                 )
+                vmRef
             }
         }
     )
@@ -143,6 +178,8 @@ private fun AuthenticatedFridayShell(
     val languageMode by viewModel.languageMode.collectAsStateWithLifecycle()
     val selectedModel by viewModel.selectedModel.collectAsStateWithLifecycle()
     val chatStreamState by viewModel.chatStreamState.collectAsStateWithLifecycle()
+    val latestToolTraces by viewModel.latestToolTraces.collectAsStateWithLifecycle()
+    val latestChatCitations by viewModel.latestChatCitations.collectAsStateWithLifecycle()
     val pendingChatAction by viewModel.pendingChatAction.collectAsStateWithLifecycle()
     val activeAgent by viewModel.activeAgent.collectAsStateWithLifecycle()
     val agentPromptInput by viewModel.agentPromptInput.collectAsStateWithLifecycle()
@@ -157,6 +194,8 @@ private fun AuthenticatedFridayShell(
     val termuxState by viewModel.termuxState.collectAsStateWithLifecycle()
     val sshProfile by viewModel.sshProfile.collectAsStateWithLifecycle()
     val sshState by viewModel.sshState.collectAsStateWithLifecycle()
+    val dhirModelState by viewModel.dhirModelState.collectAsStateWithLifecycle()
+    val syncStatus by viewModel.syncStatus.collectAsStateWithLifecycle()
     val commandTimeoutSeconds by viewModel.commandTimeoutSeconds.collectAsStateWithLifecycle()
     val isCommandRunning by viewModel.isCommandRunning.collectAsStateWithLifecycle()
     val pendingApproval by viewModel.pendingApproval.collectAsStateWithLifecycle()
@@ -232,6 +271,9 @@ private fun AuthenticatedFridayShell(
                     voiceState = voiceState,
                     sshState = sshState,
                     sshProfile = sshProfile,
+                    dhirModelState = dhirModelState,
+                    syncStatus = syncStatus,
+                    isOfflineSession = isOfflineSession,
                     onSelectLanguage = viewModel::setLanguageMode,
                     onSelectModel = viewModel::setSelectedModel,
                     onSelectAgent = viewModel::selectAgent,
@@ -249,10 +291,23 @@ private fun AuthenticatedFridayShell(
                         navigateToTab(ROUTE_TOOLS)
                     },
                     onOpenRemoteSettings = { navigateToTab(ROUTE_REMOTE_SETTINGS) },
+                    onImportDhirModel = viewModel::importDhirModelUri,
+                    onDownloadDhirModel = viewModel::downloadDhirModel,
+                    onCancelDhirDownload = viewModel::cancelDhirModelDownload,
+                    onLoadDhirModel = viewModel::loadDhirModel,
+                    onUnloadDhirModel = viewModel::unloadDhirModel,
+                    onDeleteDhirModel = viewModel::deleteDhirModel,
+                    onSyncNow = {
+                        if (isOfflineSession) onExitOfflineToSignIn() else viewModel.syncCloudNow()
+                    },
                     onSignOut = {
                         viewModel.stopSpeaking()
                         viewModel.stopVoiceInput()
-                        signOut(credentialManager, scope)
+                        if (isOfflineSession) {
+                            onExitOfflineToSignIn()
+                        } else {
+                            signOut(credentialManager, scope)
+                        }
                     }
                 )
             }
@@ -266,6 +321,9 @@ private fun AuthenticatedFridayShell(
                     pendingAction = pendingChatAction,
                     voiceState = voiceState,
                     prefillPrompt = chatPrefillPrompt,
+                    toolTraces = latestToolTraces,
+                    latestCitations = latestChatCitations,
+                    dhirModelState = dhirModelState,
                     onConsumePrefill = { chatPrefillPrompt = null },
                     onSelectLanguage = viewModel::setLanguageMode,
                     onSelectModel = viewModel::setSelectedModel,
