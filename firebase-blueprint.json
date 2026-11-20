@@ -1,0 +1,146 @@
+{
+  "entities": {
+    "LearningNote": {
+      "title": "LearningNote",
+      "description": "A cybersecurity study note or saved AI brief authored or bookmarked by the authenticated user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the note owner."
+        },
+        "title": {
+          "type": "string",
+          "description": "Short title for the cybersecurity note (1-120 chars)."
+        },
+        "content": {
+          "type": "string",
+          "description": "Detailed body of the note or AI explanation (1-8000 chars)."
+        },
+        "category": {
+          "type": "string",
+          "description": "Knowledge domain category.",
+          "enum": ["NETWORKING", "LINUX", "OWASP", "WEB_API", "AGENT_BRIEF", "GENERAL"]
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "Whether the note is pinned for quick reference."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the note was created (submitted via FieldValue.serverTimestamp())."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the note was last updated (submitted via FieldValue.serverTimestamp())."
+        }
+      },
+      "required": ["userId", "title", "content", "category", "pinned", "createdAt", "updatedAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A stored FRIDAY AI Chat or specialized agent conversation entry.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the conversation owner."
+        },
+        "role": {
+          "type": "string",
+          "description": "Message sender role.",
+          "enum": ["USER", "FRIDAY"]
+        },
+        "content": {
+          "type": "string",
+          "description": "Message text content (1-15000 chars)."
+        },
+        "languageMode": {
+          "type": "string",
+          "description": "Selected response/voice language mode.",
+          "enum": ["ENGLISH", "HINDI", "HINGLISH"]
+        },
+        "agentType": {
+          "type": "string",
+          "description": "Originating FRIDAY mode or specialized agent.",
+          "enum": [
+            "CHAT",
+            "RESEARCH",
+            "LEARNING",
+            "CODE_ANALYSIS",
+            "REPORT_ANALYSIS",
+            "CODING",
+            "FILE_ANALYSIS",
+            "WEB_RESEARCH",
+            "TERMINAL_REVIEW"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the message was stored (submitted via FieldValue.serverTimestamp())."
+        }
+      },
+      "required": ["userId", "role", "content", "languageMode", "agentType", "createdAt"]
+    },
+    "TerminalLog": {
+      "title": "TerminalLog",
+      "description": "An audited, secret-redacted log entry for an approved or rejected terminal/sandbox command.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the operator."
+        },
+        "command": {
+          "type": "string",
+          "description": "Redacted command string submitted by the user (1-1000 chars)."
+        },
+        "environment": {
+          "type": "string",
+          "description": "Target environment identifier.",
+          "enum": ["TERMUX_BRIDGE", "LINUX_SERVER_BRIDGE", "CODE_SANDBOX"]
+        },
+        "status": {
+          "type": "string",
+          "description": "Execution disposition status.",
+          "enum": ["EXECUTED", "CANCELLED", "BLOCKED", "BRIDGE_UNAVAILABLE", "TIMEOUT", "ERROR"]
+        },
+        "output": {
+          "type": "string",
+          "description": "Redacted stdout/stderr or diagnostic status message (0-8000 chars)."
+        },
+        "exitCode": {
+          "type": "integer",
+          "description": "Process exit code, or -1 if not executed."
+        },
+        "approvedByUser": {
+          "type": "boolean",
+          "description": "Explicit user approval flag required before execution."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the log entry was created."
+        }
+      },
+      "required": ["userId", "command", "environment", "status", "output", "exitCode", "approvedByUser", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/notes/{noteId}": {
+      "schema": { "$ref": "#/entities/LearningNote" },
+      "description": "User-scoped cybersecurity learning notes and saved AI briefs."
+    },
+    "/users/{userId}/chat_messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "User-scoped FRIDAY AI conversation and agent history."
+    },
+    "/users/{userId}/terminal_logs/{logId}": {
+      "schema": { "$ref": "#/entities/TerminalLog" },
+      "description": "User-scoped audited terminal and sandbox execution logs with credentials redacted."
+    }
+  }
+}

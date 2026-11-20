@@ -1,0 +1,185 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global safety net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened global primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Domain validation helpers
+    function isValidNoteCategory(cat) {
+      return cat in ['NETWORKING', 'LINUX', 'OWASP', 'WEB_API', 'AGENT_BRIEF', 'GENERAL'];
+    }
+
+    function isValidLearningNote(data, userId) {
+      return data.userId is string &&
+             data.userId.size() >= 1 &&
+             data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.userId == userId &&
+             data.title is string &&
+             data.title.size() >= 1 &&
+             data.title.size() <= 120 &&
+             data.content is string &&
+             data.content.size() >= 1 &&
+             data.content.size() <= 8000 &&
+             data.category is string &&
+             data.category.size() <= 32 &&
+             isValidNoteCategory(data.category) &&
+             data.pinned is bool &&
+             data.createdAt is timestamp &&
+             data.createdAt <= request.time &&
+             data.updatedAt is timestamp &&
+             data.updatedAt <= request.time;
+    }
+
+    function isValidLanguageMode(mode) {
+      return mode in ['ENGLISH', 'HINDI', 'HINGLISH'];
+    }
+
+    function isValidAgentType(agent) {
+      return agent in [
+        'CHAT',
+        'RESEARCH',
+        'LEARNING',
+        'CODE_ANALYSIS',
+        'REPORT_ANALYSIS',
+        'CODING',
+        'FILE_ANALYSIS',
+        'WEB_RESEARCH',
+        'TERMINAL_REVIEW'
+      ];
+    }
+
+    function isValidChatMessage(data, userId) {
+      return data.userId is string &&
+             data.userId.size() >= 1 &&
+             data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.userId == userId &&
+             data.role is string &&
+             data.role.size() <= 16 &&
+             data.role in ['USER', 'FRIDAY'] &&
+             data.content is string &&
+             data.content.size() >= 1 &&
+             data.content.size() <= 15000 &&
+             data.languageMode is string &&
+             data.languageMode.size() <= 16 &&
+             isValidLanguageMode(data.languageMode) &&
+             data.agentType is string &&
+             data.agentType.size() <= 32 &&
+             isValidAgentType(data.agentType) &&
+             data.createdAt is timestamp &&
+             data.createdAt <= request.time;
+    }
+
+    function isValidTerminalEnvironment(env) {
+      return env in ['TERMUX_BRIDGE', 'LINUX_SERVER_BRIDGE', 'CODE_SANDBOX'];
+    }
+
+    function isValidTerminalStatus(status) {
+      return status in ['EXECUTED', 'CANCELLED', 'BLOCKED', 'BRIDGE_UNAVAILABLE', 'TIMEOUT', 'ERROR'];
+    }
+
+    function isValidTerminalLog(data, userId) {
+      return data.userId is string &&
+             data.userId.size() >= 1 &&
+             data.userId.size() <= 128 &&
+             data.userId == request.auth.uid &&
+             data.userId == userId &&
+             data.command is string &&
+             data.command.size() >= 1 &&
+             data.command.size() <= 1000 &&
+             data.environment is string &&
+             data.environment.size() <= 32 &&
+             isValidTerminalEnvironment(data.environment) &&
+             data.status is string &&
+             data.status.size() <= 32 &&
+             isValidTerminalStatus(data.status) &&
+             data.output is string &&
+             data.output.size() <= 8000 &&
+             data.exitCode is int &&
+             data.exitCode >= -1 &&
+             data.exitCode <= 255 &&
+             data.approvedByUser is bool &&
+             data.createdAt is timestamp &&
+             data.createdAt <= request.time;
+    }
+
+    // User-scoped Learning Notes collection
+    match /users/{userId}/notes/{noteId} {
+      allow get: if isOwner(userId) && isValidId(noteId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(noteId) &&
+                       incoming().keys().hasAll(['userId', 'title', 'content', 'category', 'pinned', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'title', 'content', 'category', 'pinned', 'createdAt', 'updatedAt']) &&
+                       isValidLearningNote(incoming(), userId);
+
+      allow update: if isOwner(userId) &&
+                       isValidId(noteId) &&
+                       isValidLearningNote(incoming(), userId) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'category', 'pinned', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(noteId);
+    }
+
+    // User-scoped Conversation History collection
+    match /users/{userId}/chat_messages/{messageId} {
+      allow get: if isOwner(userId) && isValidId(messageId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(messageId) &&
+                       incoming().keys().hasAll(['userId', 'role', 'content', 'languageMode', 'agentType', 'createdAt']) &&
+                       incoming().keys().hasOnly(['userId', 'role', 'content', 'languageMode', 'agentType', 'createdAt']) &&
+                       isValidChatMessage(incoming(), userId);
+
+      allow update: if false;
+
+      allow delete: if isOwner(userId) && isValidId(messageId);
+    }
+
+    // User-scoped Terminal & Sandbox Execution Logs collection (immutable audit trail)
+    match /users/{userId}/terminal_logs/{logId} {
+      allow get: if isOwner(userId) && isValidId(logId);
+      allow list: if isOwner(userId);
+
+      allow create: if isOwner(userId) &&
+                       isValidId(logId) &&
+                       incoming().keys().hasAll(['userId', 'command', 'environment', 'status', 'output', 'exitCode', 'approvedByUser', 'createdAt']) &&
+                       incoming().keys().hasOnly(['userId', 'command', 'environment', 'status', 'output', 'exitCode', 'approvedByUser', 'createdAt']) &&
+                       isValidTerminalLog(incoming(), userId);
+
+      allow update: if false;
+
+      allow delete: if isOwner(userId) && isValidId(logId);
+    }
+  }
+}
