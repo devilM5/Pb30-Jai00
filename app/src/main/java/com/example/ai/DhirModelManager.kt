@@ -57,7 +57,7 @@ class DhirModelManager(
     }
 
     fun inspectModelState(loadedFilePath: String? = null, effectiveCtx: Int = 0, arch: String = ""): DhirModelState {
-        val (totalMb, availMb) = readDeviceMemoryMb(context)
+        val (totalMb, availMb, lowMem) = readDeviceMemoryInfo(context)
         val nativeReady = nativeReadyProvider()
         val existingFile = findInstalledDhirFile()
 
@@ -88,7 +88,12 @@ class DhirModelManager(
         }
 
         val isLoaded = !loadedFilePath.isNullOrBlank() && loadedFilePath == existingFile.absolutePath
-        val recommendedCtx = recommendContextSize(totalMb)
+        val recommendedCtx = recommendContextSize(
+            totalRamMb = totalMb,
+            availableRamMb = availMb,
+            modelSizeBytes = existingFile.length(),
+            isLowRamDevice = lowMem
+        )
         return DhirModelState(
             status = if (isLoaded) DhirModelStatus.LOADED else DhirModelStatus.READY_UNLOADED,
             expectedFilename = EXPECTED_FILENAME_LOWER,
@@ -101,9 +106,13 @@ class DhirModelManager(
             availableDeviceRamMb = availMb,
             nativeBackendReady = nativeReady,
             statusDetail = if (isLoaded) {
-                "Dhīr 2B loaded in local RAM (ctx=${if (effectiveCtx > 0) effectiveCtx else recommendedCtx})."
+                "Dhīr 2B loaded in local RAM (ctx=${if (effectiveCtx > 0) effectiveCtx else recommendedCtx}, ${availMb}MB free)."
             } else {
-                val ramNote = if (totalMb in 1..3400) " Low-RAM device (${totalMb}MB): using 2048 ctx." else ""
+                val ramNote = when {
+                    lowMem || (availMb in 1..900L) -> " Low free RAM (${availMb}MB free): using safe ${recommendedCtx} ctx."
+                    totalMb in 1..3400L -> " Low-RAM device (${totalMb}MB): using ${recommendedCtx} ctx."
+                    else -> ""
+                }
                 "GGUF verified (${formatMb(existingFile.length())}). Tap Load Model or send a prompt to start local inference.$ramNote"
             }
         )
@@ -359,30 +368,89 @@ class DhirModelManager(
             }
         }
 
-        fun recommendContextSize(totalRamMb: Long, requestedCtx: Int = 4096): Int {
-            val safeCap = when {
+        fun recommendContextSize(
+            totalRamMb: Long,
+            requestedCtx: Int = 4096,
+            availableRamMb: Long = -1L,
+            modelSizeBytes: Long = 0L,
+            isLowRamDevice: Boolean = false
+        ): Int {
+            val totalCap = when {
                 totalRamMb <= 0L -> 2048
                 totalRamMb < 3200L -> 1536
                 totalRamMb < 5200L -> 2048
                 else -> 4096
             }
-            return requestedCtx.coerceAtMost(safeCap).coerceAtLeast(1024)
+            val modelMb = (modelSizeBytes / (1024L * 1024L)).coerceAtLeast(0L)
+            val effectiveAvailMb = if (availableRamMb >= 0L) {
+                val extraModelReserve = (modelMb - 1400L).coerceAtLeast(0L) / 2L
+                (availableRamMb - extraModelReserve).coerceAtLeast(0L)
+            } else {
+                -1L
+            }
+            val availCap = when {
+                isLowRamDevice && (effectiveAvailMb in 0L..750L) -> 512
+                isLowRamDevice -> 1024
+                effectiveAvailMb < 0L -> totalCap
+                effectiveAvailMb < 750L -> 512
+                effectiveAvailMb < 1150L -> 1024
+                effectiveAvailMb < 1650L -> 1536
+                effectiveAvailMb < 2400L -> 2048
+                else -> 4096
+            }
+            val safeCap = minOf(totalCap, availCap)
+            return requestedCtx.coerceAtMost(safeCap).coerceAtLeast(512)
         }
 
-        private fun readDeviceMemoryMb(context: Context): Pair<Long, Long> {
+        fun checkLoadMemorySafety(context: Context, modelSizeBytes: Long): String? {
+            val (_, availMb, lowMem) = readDeviceMemoryInfo(context)
+            if (lowMem || (availMb in 1..449L)) {
+                return "Available RAM is critically low (${availMb}MB free). Close background apps before loading dhir-2b-Q4_K_M.gguf (~${formatMb(modelSizeBytes)})."
+            }
+            return null
+        }
+
+        private data class DeviceMemorySnapshot(
+            val totalMb: Long,
+            val availMb: Long,
+            val lowMemory: Boolean
+        )
+
+        private fun readDeviceMemoryInfo(context: Context): DeviceMemorySnapshot {
             return runCatching {
                 val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-                    ?: return 0L to 0L
+                    ?: return DeviceMemorySnapshot(0L, 0L, false)
                 val info = ActivityManager.MemoryInfo()
                 am.getMemoryInfo(info)
-                (info.totalMem / (1024L * 1024L)) to (info.availMem / (1024L * 1024L))
-            }.getOrDefault(0L to 0L)
+                DeviceMemorySnapshot(
+                    totalMb = info.totalMem / (1024L * 1024L),
+                    availMb = info.availMem / (1024L * 1024L),
+                    lowMemory = info.lowMemory || am.isLowRamDevice
+                )
+            }.getOrDefault(DeviceMemorySnapshot(0L, 0L, false))
         }
 
         private fun formatMb(bytes: Long): String {
             val mb = bytes / (1024.0 * 1024.0)
             return if (mb >= 1024.0) String.format("%.2f GB", mb / 1024.0)
             else String.format("%.0f MB", mb)
+        }
+
+        private val activeUnloadCallbacks = java.util.Collections.synchronizedSet(mutableSetOf<() -> Unit>())
+
+        fun registerMemoryUnloadHandler(onTrimUnload: () -> Unit): () -> Unit {
+            activeUnloadCallbacks.add(onTrimUnload)
+            return { activeUnloadCallbacks.remove(onTrimUnload) }
+        }
+
+        @Suppress("DEPRECATION")
+        fun onSystemTrimMemory(level: Int) {
+            if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                level == android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+            ) {
+                val handlers = synchronized(activeUnloadCallbacks) { activeUnloadCallbacks.toList() }
+                handlers.forEach { runCatching { it.invoke() } }
+            }
         }
     }
 }

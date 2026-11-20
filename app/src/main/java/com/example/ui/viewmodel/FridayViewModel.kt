@@ -26,6 +26,7 @@ import com.example.data.model.LanguageMode
 import com.example.data.model.LearningNote
 import com.example.data.model.LoadedProjectFile
 import com.example.data.model.NoteCategory
+import com.example.data.model.OfflineMigrationSummary
 import com.example.data.model.PendingCommandApproval
 import com.example.data.model.ProposedFilePatch
 import com.example.data.model.QuickCommandItem
@@ -210,6 +211,9 @@ class FridayViewModel(
     private val _memorySearchQuery = MutableStateFlow("")
     val memorySearchQuery: StateFlow<String> = _memorySearchQuery.asStateFlow()
 
+    private val _offlineMigration = MutableStateFlow(OfflineMigrationSummary())
+    val offlineMigration: StateFlow<OfflineMigrationSummary> = _offlineMigration.asStateFlow()
+
     private val _statusBanner = MutableStateFlow<String?>(null)
     val statusBanner: StateFlow<String?> = _statusBanner.asStateFlow()
 
@@ -221,6 +225,56 @@ class FridayViewModel(
     private var fileJob: Job? = null
     private var activeCommandJob: Job? = null
     private var modelTransferJob: Job? = null
+    private var unregisterMemoryHandler: (() -> Unit)? = null
+
+    init {
+        if (dhirModelManager != null) {
+            unregisterMemoryHandler = DhirModelManager.registerMemoryUnloadHandler {
+                aiRepository.unloadDhir()
+            }
+        }
+        if (currentUserId != MemoryRepository.LOCAL_OFFLINE_USER_ID) {
+            viewModelScope.launch {
+                val summary = memoryRepository.inspectOfflineMigrationCandidate(currentUserId)
+                if (summary.hasPendingPrompt) {
+                    _offlineMigration.value = summary
+                }
+            }
+        }
+    }
+
+    fun confirmOfflineMigration(includeTerminalLogs: Boolean = true) {
+        if (currentUserId == MemoryRepository.LOCAL_OFFLINE_USER_ID) return
+        viewModelScope.launch {
+            _offlineMigration.value = _offlineMigration.value.copy(
+                isMigrating = true,
+                statusDetail = "Migrating local records safely to your signed-in profile…"
+            )
+            val result = memoryRepository.migrateOfflineDataWithConsent(
+                targetUserId = currentUserId,
+                explicitUserConsent = true,
+                includeLocalTerminalLogs = includeTerminalLogs,
+                clearSourceAfterCopy = true
+            )
+            result.onSuccess { migrated ->
+                _offlineMigration.value = OfflineMigrationSummary(
+                    hasPendingPrompt = false,
+                    statusDetail = "Migrated $migrated record(s)."
+                )
+                _statusBanner.value = "Moved $migrated offline record(s) into your account vault."
+            }.onFailure { err ->
+                _offlineMigration.value = _offlineMigration.value.copy(
+                    isMigrating = false,
+                    statusDetail = err.localizedMessage ?: "Migration failed; offline data preserved."
+                )
+                _statusBanner.value = "Migration failed; original offline data kept intact."
+            }
+        }
+    }
+
+    fun dismissOfflineMigrationPrompt() {
+        _offlineMigration.value = OfflineMigrationSummary(hasPendingPrompt = false)
+    }
 
     fun setLanguageMode(mode: LanguageMode) { _languageMode.value = mode }
     fun setSelectedModel(option: AiModelOption) { _selectedModel.value = option }
@@ -322,13 +376,27 @@ class FridayViewModel(
             requestCommandExecution(routedAction.command, _selectedExecutionEnv.value)
         } else if (routedAction is ConversationalAction.RequestAuthorizedNmap) {
             requestCommandExecution(routedAction.suggestedCommand, _selectedExecutionEnv.value)
+        } else if (routedAction is ConversationalAction.AskScanTarget) {
+            chatJob?.cancel()
+            chatJob = viewModelScope.launch {
+                _chatStreamState.value = UiState.Idle
+                _latestToolTraces.value = emptyList()
+                _latestChatCitations.value = emptyList()
+                memoryRepository.saveChatMessage("USER", prompt, effectiveLanguage, AgentType.CHAT, currentUserId)
+                memoryRepository.saveChatMessage("FRIDAY", routedAction.message, effectiveLanguage, AgentType.CHAT, currentUserId)
+                if (autoSpeakResponse) speakText(routedAction.message, id = "latest_friday_reply")
+            }
+            return
         }
 
         chatJob?.cancel()
         chatJob = viewModelScope.launch {
-            val currentMessages = (chatHistoryState.value as? UiState.Success)?.data.orEmpty()
-            val historyPairs = currentMessages.filter { it.agentType == AgentType.CHAT.name }
-                .takeLast(12).map { it.role to it.content }
+            val historyPairs = memoryRepository.getScopedAgentHistory(
+                userId = currentUserId,
+                agentType = AgentType.CHAT,
+                currentQuery = prompt,
+                maxTurns = 12
+            )
 
             _chatStreamState.value = UiState.Loading
             _latestToolTraces.value = emptyList()
@@ -389,10 +457,22 @@ class FridayViewModel(
         agentJob?.cancel()
         agentJob = viewModelScope.launch {
             val mode = _languageMode.value
+            val scopedHistory = memoryRepository.getScopedAgentHistory(
+                userId = currentUserId,
+                agentType = agent,
+                currentQuery = input,
+                maxTurns = 6
+            )
             _agentStreamState.value = UiState.Loading
             var latestText = ""
             try {
-                aiRepository.streamResponse(input, mode, agent, _selectedModel.value).collect { partial ->
+                aiRepository.streamResponse(
+                    prompt = input,
+                    languageMode = mode,
+                    agentType = agent,
+                    modelOption = _selectedModel.value,
+                    history = scopedHistory
+                ).collect { partial ->
                     latestText = partial
                     _agentStreamState.value = UiState.Streaming(partial)
                 }
@@ -418,6 +498,12 @@ class FridayViewModel(
         reportJob?.cancel()
         reportJob = viewModelScope.launch {
             val mode = _languageMode.value
+            val scopedHistory = memoryRepository.getScopedAgentHistory(
+                userId = currentUserId,
+                agentType = AgentType.REPORT_ANALYSIS,
+                currentQuery = report.take(200),
+                maxTurns = 4
+            )
             _reportAnalysisState.value = UiState.Loading
             val prefix = if (isSimulatedSample) {
                 "Analyze this SIMULATED LAB SAMPLE report (label as Educational Lab Review):\n\n"
@@ -426,12 +512,29 @@ class FridayViewModel(
             }
             var latestText = ""
             try {
-                aiRepository.streamResponse(prefix + report, mode, AgentType.REPORT_ANALYSIS, _selectedModel.value).collect { partial ->
+                aiRepository.streamResponse(
+                    prompt = prefix + report,
+                    languageMode = mode,
+                    agentType = AgentType.REPORT_ANALYSIS,
+                    modelOption = _selectedModel.value,
+                    history = scopedHistory
+                ).collect { partial ->
                     latestText = partial
                     _reportAnalysisState.value = UiState.Streaming(partial)
                 }
-                _reportAnalysisState.value = if (latestText.isNotBlank()) UiState.Success(latestText)
-                else UiState.Error("Report analysis returned empty output.")
+                if (latestText.isNotBlank()) {
+                    _reportAnalysisState.value = UiState.Success(latestText)
+                    memoryRepository.saveChatMessage(
+                        "USER",
+                        "[Report Audit] ${report.take(240)}",
+                        mode,
+                        AgentType.REPORT_ANALYSIS,
+                        currentUserId
+                    )
+                    memoryRepository.saveChatMessage("FRIDAY", latestText, mode, AgentType.REPORT_ANALYSIS, currentUserId)
+                } else {
+                    _reportAnalysisState.value = UiState.Error("Report analysis returned empty output.")
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -460,15 +563,39 @@ class FridayViewModel(
         }
         codingJob?.cancel()
         codingJob = viewModelScope.launch {
+            val mode = _languageMode.value
+            val scopedHistory = memoryRepository.getScopedAgentHistory(
+                userId = currentUserId,
+                agentType = AgentType.CODING,
+                currentQuery = "$actionLabel $task",
+                maxTurns = 4
+            )
             _codingAiState.value = UiState.Loading
             var latest = ""
             try {
-                aiRepository.streamResponse(prompt, _languageMode.value, AgentType.CODING, _selectedModel.value).collect {
+                aiRepository.streamResponse(
+                    prompt = prompt,
+                    languageMode = mode,
+                    agentType = AgentType.CODING,
+                    modelOption = _selectedModel.value,
+                    history = scopedHistory
+                ).collect {
                     latest = it
                     _codingAiState.value = UiState.Streaming(it)
                 }
-                _codingAiState.value = if (latest.isNotBlank()) UiState.Success(latest)
-                else UiState.Error("Coding Agent returned an empty response.")
+                if (latest.isNotBlank()) {
+                    _codingAiState.value = UiState.Success(latest)
+                    memoryRepository.saveChatMessage(
+                        "USER",
+                        "[Coding:$actionLabel:${lang.displayName}] ${task.ifBlank { code.take(180) }}",
+                        mode,
+                        AgentType.CODING,
+                        currentUserId
+                    )
+                    memoryRepository.saveChatMessage("FRIDAY", latest, mode, AgentType.CODING, currentUserId)
+                } else {
+                    _codingAiState.value = UiState.Error("Coding Agent returned an empty response.")
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -776,7 +903,8 @@ class FridayViewModel(
                         sshExecutor?.executeCommand(
                             profile = _sshProfile.value,
                             command = pending.command,
-                            timeoutSeconds = pending.timeoutSeconds
+                            timeoutSeconds = pending.timeoutSeconds,
+                            approvedByUser = true
                         ) ?: BridgeExecutionResult(
                             executed = false,
                             status = TerminalExecutionStatus.BRIDGE_UNAVAILABLE,
@@ -790,12 +918,14 @@ class FridayViewModel(
                         val termuxRes = termuxClient?.executeApprovedCommand(
                             state = _termuxState.value,
                             command = pending.command,
-                            timeoutSeconds = pending.timeoutSeconds
+                            timeoutSeconds = pending.timeoutSeconds,
+                            approvedByUser = true
                         ) ?: bridgeClient.executeApprovedCommand(
                             command = pending.command,
                             environment = TerminalEnvironment.TERMUX_BRIDGE,
                             endpointUrl = _termuxState.value.companionUrl,
-                            sessionToken = _termuxState.value.companionToken
+                            sessionToken = _termuxState.value.companionToken,
+                            approvedByUser = true
                         )
                         val nextTools = ToolAvailabilityParser.updateFromExecution(
                             current = _termuxState.value.toolStatuses,
@@ -812,7 +942,8 @@ class FridayViewModel(
                             command = pending.command,
                             environment = TerminalEnvironment.CODE_SANDBOX,
                             endpointUrl = _termuxState.value.companionUrl,
-                            sessionToken = _termuxState.value.companionToken
+                            sessionToken = _termuxState.value.companionToken,
+                            approvedByUser = true
                         )
                     }
                 }
@@ -893,6 +1024,9 @@ class FridayViewModel(
                     explainInHindi = explainInHindi,
                     modelOption = _selectedModel.value
                 )
+                res.youtubeResults.forEach { video ->
+                    memoryRepository.saveYouTubeLearningRecord(currentUserId, video)
+                }
                 _webResearchState.value = UiState.Success(res)
                 if (autoSpeak) {
                     voiceController.speak(res.answer, "web_research_reply", preferHindi = explainInHindi || _languageMode.value != LanguageMode.ENGLISH)
@@ -919,28 +1053,81 @@ class FridayViewModel(
         }
     }
 
+    fun selectLoadedFileChunk(chunkIndex: Int) {
+        val current = _loadedFile.value ?: return
+        val maxIdx = maxOf(0, current.chunksCount - 1)
+        val safeIdx = chunkIndex.coerceIn(0, maxIdx)
+        val notice = ProjectFileHelper.buildTruncationNotice(
+            fileName = current.fileName,
+            extractedChars = current.totalCharsExtracted,
+            totalBytes = current.sizeBytes,
+            bytesTruncated = current.sizeBytes > 1024L * 1024L && !current.encodingLabel.startsWith("PDF"),
+            chunkIndex = safeIdx,
+            chunkCount = current.chunksCount,
+            extraNote = if (current.encodingLabel.startsWith("PDF")) current.encodingLabel else null
+        )
+        _loadedFile.value = current.copy(
+            currentChunkIndex = safeIdx,
+            partialReadWarning = notice
+        )
+    }
+
     fun analyzeLoadedFile(instruction: String) {
         val file = _loadedFile.value ?: return
         fileJob?.cancel()
         fileJob = viewModelScope.launch {
+            val mode = _languageMode.value
+            val safeChunkIdx = file.currentChunkIndex.coerceIn(0, maxOf(0, file.chunksCount - 1))
+            val chunkContent = ProjectFileHelper.getChunk(file.content, safeChunkIdx)
+            val scopedHistory = memoryRepository.getScopedAgentHistory(
+                userId = currentUserId,
+                agentType = AgentType.FILE_ANALYSIS,
+                currentQuery = "${file.fileName} $instruction",
+                maxTurns = 4
+            )
             _fileAnalysisState.value = UiState.Loading
+            val truncationHeader = file.partialReadWarning?.let {
+                "\n[IMPORTANT FILE COVERAGE NOTICE: $it Explicitly inform the operator that this analysis covers Chunk ${safeChunkIdx + 1}/${file.chunksCount} only — do NOT claim the entire file was analyzed.]\n"
+            }.orEmpty()
             val prompt = """
-                Analyze file '${file.fileName}' (${file.mimeType}, ${file.sizeBytes} bytes):
+                Analyze file '${file.fileName}' (${file.mimeType}, ${file.sizeBytes} bytes, Encoding: ${file.encodingLabel}, Chunk ${safeChunkIdx + 1}/${file.chunksCount}):$truncationHeader
                 Operator request: ${instruction.ifBlank { "Summarize architecture, detect bugs, and suggest secure improvements." }}
 
-                File Content:
+                File Content (Chunk ${safeChunkIdx + 1} of ${file.chunksCount}):
                 ```
-                ${file.content.take(12000)}
+                $chunkContent
                 ```
             """.trimIndent()
             var latest = ""
             try {
-                aiRepository.streamResponse(prompt, _languageMode.value, AgentType.FILE_ANALYSIS, _selectedModel.value).collect {
+                aiRepository.streamResponse(
+                    prompt = prompt,
+                    languageMode = mode,
+                    agentType = AgentType.FILE_ANALYSIS,
+                    modelOption = _selectedModel.value,
+                    history = scopedHistory
+                ).collect {
                     latest = it
                     _fileAnalysisState.value = UiState.Streaming(it)
                 }
-                _fileAnalysisState.value = if (latest.isNotBlank()) UiState.Success(latest)
-                else UiState.Error("File Agent returned an empty response.")
+                if (latest.isNotBlank()) {
+                    val annotated = if (!file.partialReadWarning.isNullOrBlank()) {
+                        "[${file.partialReadWarning}]\n\n$latest"
+                    } else {
+                        latest
+                    }
+                    _fileAnalysisState.value = UiState.Success(annotated)
+                    memoryRepository.saveChatMessage(
+                        "USER",
+                        "[File:${file.fileName} Chunk ${safeChunkIdx + 1}/${file.chunksCount}] ${instruction.ifBlank { "Analyze" }}",
+                        mode,
+                        AgentType.FILE_ANALYSIS,
+                        currentUserId
+                    )
+                    memoryRepository.saveChatMessage("FRIDAY", annotated, mode, AgentType.FILE_ANALYSIS, currentUserId)
+                } else {
+                    _fileAnalysisState.value = UiState.Error("File Agent returned an empty response.")
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1040,6 +1227,8 @@ class FridayViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        unregisterMemoryHandler?.invoke()
+        unregisterMemoryHandler = null
         sshExecutor?.abortRunningChannel()
         aiRepository.abortGeneration()
         voiceController.release()

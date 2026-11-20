@@ -44,6 +44,7 @@ data class LearningNoteEntity(
     tableName = "chat_messages",
     indices = [
         Index(value = ["userId", "pendingDelete", "createdAtMillis"]),
+        Index(value = ["userId", "agentType", "pendingDelete", "createdAtMillis"]),
         Index(value = ["userId", "pendingSync"])
     ]
 )
@@ -104,7 +105,10 @@ data class TerminalLogEntity(
 
 @Entity(
     tableName = "learning_records",
-    indices = [Index(value = ["userId", "recordType"])]
+    indices = [
+        Index(value = ["userId", "recordType"]),
+        Index(value = ["userId", "recordType", "itemId"], unique = true)
+    ]
 )
 data class LearningRecordEntity(
     @PrimaryKey val id: String,
@@ -112,11 +116,15 @@ data class LearningRecordEntity(
     val recordType: String,
     val itemId: String,
     val completed: Boolean,
-    val updatedAtMillis: Long
+    val updatedAtMillis: Long,
+    val title: String = "",
+    val sourceUrl: String = "",
+    val summary: String = ""
 ) {
     companion object {
         const val TYPE_CHECKLIST = "CHECKLIST"
         const val TYPE_QUIZ = "QUIZ"
+        const val TYPE_YOUTUBE = "YOUTUBE"
 
         fun key(userId: String, type: String, itemId: String): String = "$userId::$type::$itemId"
     }

@@ -91,8 +91,24 @@ class TerminalBridgeClient(
         command: String,
         environment: TerminalEnvironment,
         endpointUrl: String,
-        sessionToken: String
+        sessionToken: String,
+        approvedByUser: Boolean = false
     ): BridgeExecutionResult = withContext(Dispatchers.IO) {
+        val policyError = CommandPolicyValidator.verifyExecutionAuthorization(
+            rawCommand = command,
+            environment = environment,
+            approvedByUser = approvedByUser
+        )
+        if (policyError != null) {
+            return@withContext BridgeExecutionResult(
+                executed = false,
+                status = TerminalExecutionStatus.BLOCKED,
+                exitCode = -1,
+                stdout = "",
+                stderr = policyError,
+                environment = environment
+            )
+        }
         val securityError = validateEndpointSecurity(endpointUrl)
         if (securityError != null) {
             return@withContext BridgeExecutionResult(

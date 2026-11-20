@@ -298,6 +298,12 @@ fun ChatScreen(
                         Spacer(Modifier.width(6.dp))
                         Text("Inspect Nmap Approval (${pendingAction.target})")
                     }
+                    is ConversationalAction.AskScanTarget -> Text(
+                        text = pendingAction.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = NeonCyan,
+                        modifier = Modifier.testTag("action_ask_scan_target_text")
+                    )
                     is ConversationalAction.RunWebResearch -> OutlinedButton(
                         onClick = { onLaunchResearchTool(pendingAction.query, pendingAction.explainInHindi) },
                         modifier = Modifier.fillMaxWidth().testTag("action_open_research_button")

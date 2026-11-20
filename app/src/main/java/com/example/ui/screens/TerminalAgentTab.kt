@@ -53,6 +53,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.core.QuickCommandStore
+import com.example.core.VaultLifecycleGuard
 import com.example.data.model.BridgeExecutionResult
 import com.example.data.model.ExecutionEnvFilter
 import com.example.data.model.ExecutionStatusFilter
@@ -113,6 +114,7 @@ fun TerminalAgentTab(
     val termuxPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) {
+        VaultLifecycleGuard.clearExternalFlow()
         onRefreshTermuxStatus()
     }
 
@@ -177,6 +179,7 @@ fun TerminalAgentTab(
                     onSelectMode = onSelectTermuxMode,
                     onUpdateCompanionHttp = onUpdateTermuxHttpConfig,
                     onRequestRunCommandPermission = {
+                        VaultLifecycleGuard.markExternalFlowLaunched()
                         termuxPermissionLauncher.launch(TermuxCompanionClient.TERMUX_PERMISSION)
                     },
                     onVerifyAndConnect = onVerifyAndConnectTermux,

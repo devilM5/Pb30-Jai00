@@ -113,6 +113,8 @@ class DhirFridayAiRepository(
         )
         val recommendedCtx = DhirModelManager.recommendContextSize(
             totalRamMb = currentState.totalDeviceRamMb,
+            availableRamMb = currentState.availableDeviceRamMb,
+            modelSizeBytes = modelFile.length(),
             requestedCtx = modelOption.contextSize
         )
 
@@ -129,12 +131,26 @@ class DhirFridayAiRepository(
 
         modelManager.updateRuntimeLoadedStatus(loadedPath = null, isLoading = true)
         val cpuThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
-        val res = llamaBridge.loadModel(modelFile.absolutePath, recommendedCtx, cpuThreads)
-        return res.fold(
+        val ctxCandidates = listOf(recommendedCtx, 1024, 512).filter { it <= recommendedCtx }.distinct()
+        var chosenCtx = recommendedCtx
+        var lastResult: Result<String> = Result.failure(IllegalStateException("Unable to load Dhīr 2B."))
+
+        for (candidateCtx in ctxCandidates) {
+            chosenCtx = candidateCtx
+            lastResult = llamaBridge.loadModel(modelFile.absolutePath, candidateCtx, cpuThreads)
+            if (lastResult.isSuccess) break
+            val msg = lastResult.exceptionOrNull()?.message.orEmpty()
+            // Only retry smaller context on context allocation / insufficient RAM errors
+            if (!msg.contains("context", ignoreCase = true) && !msg.contains("RAM", ignoreCase = true)) {
+                break
+            }
+        }
+
+        return lastResult.fold(
             onSuccess = { arch ->
                 modelManager.updateRuntimeLoadedStatus(
                     loadedPath = modelFile.absolutePath,
-                    effectiveCtx = recommendedCtx,
+                    effectiveCtx = chosenCtx,
                     arch = arch
                 )
                 Result.success(Unit)
@@ -165,22 +181,24 @@ class DhirFridayAiRepository(
     ): Flow<String> = flow {
         ensureDhirLoaded(modelOption).getOrThrow()
 
+        val activeCtx = llamaBridge.getLoadedContextSize().takeIf { it > 0 } ?: modelOption.contextSize
         val systemPrompt = buildSystemPrompt(languageMode, agentType)
-        val turns = buildList {
-            if (agentType == AgentType.CHAT && history.isNotEmpty()) {
-                history.takeLast(8).forEach { (role, content) ->
-                    val normalized = if (role.equals("FRIDAY", ignoreCase = true) || role.equals("assistant", ignoreCase = true)) {
-                        "assistant"
-                    } else if (role.equals("observation", ignoreCase = true)) {
-                        "observation"
-                    } else {
-                        "user"
-                    }
-                    add(DhirTurn(role = normalized, content = content.take(1200)))
-                }
+        val historyTurns = history.takeLast(10).map { (role, content) ->
+            val normalized = when {
+                role.equals("FRIDAY", ignoreCase = true) || role.equals("assistant", ignoreCase = true) -> "assistant"
+                role.equals("observation", ignoreCase = true) -> "observation"
+                else -> "user"
             }
-            add(DhirTurn(role = "user", content = prompt))
+            DhirTurn(role = normalized, content = content.take(1200))
         }
+        val turns = DhirPromptFormatter.trimTurnsToBudget(
+            systemPrompt = systemPrompt,
+            historyTurns = historyTurns,
+            currentUserTurn = DhirTurn(role = "user", content = prompt),
+            toolsJson = toolsJson,
+            contextSizeTokens = activeCtx,
+            reserveOutputTokens = modelOption.maxTokens.coerceIn(192, activeCtx / 2)
+        )
 
         val formattedPrompt = DhirPromptFormatter.formatPrompt(
             systemPrompt = systemPrompt,
@@ -206,9 +224,10 @@ class DhirFridayAiRepository(
         } catch (e: TimeoutCancellationException) {
             Log.e(TAG, "Dhīr local inference timed out", e)
             llamaBridge.abortGeneration()
-            if (latest.isBlank()) {
-                throw IllegalStateException("Dhīr local inference timed out after 120s.", e)
-            }
+            throw IllegalStateException(
+                "Dhīr local inference timed out after 120s before finishing; incomplete output was discarded.",
+                e
+            )
         } catch (e: CancellationException) {
             llamaBridge.abortGeneration()
             throw e

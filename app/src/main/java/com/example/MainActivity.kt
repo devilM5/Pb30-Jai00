@@ -1,11 +1,13 @@
 package com.example
 
+import android.content.ComponentCallbacks2
 import android.graphics.Color
 import android.os.Bundle
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.fragment.app.FragmentActivity
+import com.example.ai.DhirModelManager
 import com.example.core.configureAppCheck
 import com.example.ui.AppNavigation
 import com.example.ui.theme.FridaySecurityTheme
@@ -29,5 +31,16 @@ class MainActivity : FragmentActivity() {
                 AppNavigation()
             }
         }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        DhirModelManager.onSystemTrimMemory(level)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onLowMemory() {
+        super.onLowMemory()
+        DhirModelManager.onSystemTrimMemory(ComponentCallbacks2.TRIM_MEMORY_COMPLETE)
     }
 }

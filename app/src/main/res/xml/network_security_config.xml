@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Deny arbitrary cleartext HTTP traffic across external/remote networks -->
+    <base-config cleartextTrafficPermitted="false" />
+
+    <!-- Narrowly allow loopback cleartext ONLY for the local Termux companion HTTP bridge -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

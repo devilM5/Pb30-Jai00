@@ -12,10 +12,15 @@
 #   public *;
 #}
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# Preserve JNI class, native methods, and TokenCallback invoked from libfriday_llama.so
+-keep class com.example.ai.AndroidLlamaNativeBridge {
+    *;
+}
+-keepclassmembers class com.example.ai.AndroidLlamaNativeBridge$* {
+    public boolean onToken(java.lang.String);
+}
+-keep interface com.example.ai.AndroidLlamaNativeBridge$TokenCallback {
+    public boolean onToken(java.lang.String);
+}
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile

@@ -1,7 +1,12 @@
 package com.example.ui
 
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -10,9 +15,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.credentials.CredentialManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -29,7 +39,9 @@ import com.example.core.DefaultBiometricGateController
 import com.example.core.FridayToolOrchestrator
 import com.example.core.QuickCommandStore
 import com.example.core.SecureSshCredentialStore
+import com.example.core.VaultLifecycleGuard
 import com.example.core.VoiceController
+import com.example.core.findFragmentActivity
 import com.example.data.model.NoteCategory
 import com.example.data.model.TerminalEnvironment
 import com.example.data.repository.DhirFridayAiRepository
@@ -119,6 +131,8 @@ private fun AuthenticatedFridayShell(
     onLockVault: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val activity = remember(context) { context.findFragmentActivity() }
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val credentialManager = remember { CredentialManager.create(context) }
 
@@ -208,8 +222,26 @@ private fun AuthenticatedFridayShell(
     val checkedChecklistIds by viewModel.checkedChecklistIds.collectAsStateWithLifecycle()
     val completedQuizModuleIds by viewModel.completedQuizModuleIds.collectAsStateWithLifecycle()
     val memorySearchQuery by viewModel.memorySearchQuery.collectAsStateWithLifecycle()
+    val offlineMigration by viewModel.offlineMigration.collectAsStateWithLifecycle()
     val voiceState by viewModel.voiceState.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
+
+    // Background lifecycle relock: relock vault & wipe in-memory secrets when app leaves foreground,
+    // while ignoring configuration changes (rotation) and transient SAF/permission system pickers.
+    DisposableEffect(lifecycleOwner, activity) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                val isRotating = activity?.isChangingConfigurations == true
+                val transientPicker = VaultLifecycleGuard.consumeOrIsWithinExternalFlow()
+                if (!isRotating && !transientPicker) {
+                    viewModel.lockVaultSession()
+                    onLockVault()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     var chatPrefillPrompt by remember { mutableStateOf<String?>(null) }
     var selectedStudioTab by remember { mutableStateOf(StudioToolTab.CODING) }
@@ -229,6 +261,42 @@ private fun AuthenticatedFridayShell(
             launchSingleTop = true
             restoreState = true
         }
+    }
+
+    // Consent-gated offline -> signed-in account migration dialog
+    if (offlineMigration.hasPendingPrompt) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!offlineMigration.isMigrating) viewModel.dismissOfflineMigrationPrompt()
+            },
+            title = { Text("Import Offline FRIDAY Data?") },
+            text = {
+                Text(
+                    "Found ${offlineMigration.offlineNotesCount} note(s), ${offlineMigration.offlineChatCount} chat message(s), " +
+                        "${offlineMigration.offlineLearningCount} learning record(s), and ${offlineMigration.offlineTerminalLogsCount} local terminal log(s) created offline. " +
+                        "Move them into your signed-in account vault? Terminal logs always remain local-only."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { viewModel.confirmOfflineMigration(includeTerminalLogs = true) },
+                    enabled = !offlineMigration.isMigrating,
+                    modifier = Modifier.testTag("confirm_offline_migration_button")
+                ) {
+                    Text(if (offlineMigration.isMigrating) "Moving…" else "Move Data")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = viewModel::dismissOfflineMigrationPrompt,
+                    enabled = !offlineMigration.isMigrating,
+                    modifier = Modifier.testTag("dismiss_offline_migration_button")
+                ) {
+                    Text("Keep Separate")
+                }
+            },
+            modifier = Modifier.testTag("offline_migration_dialog")
+        )
     }
 
     // Global Explicit Command Approval Dialog (never runs arbitrary commands silently)
@@ -421,7 +489,8 @@ private fun AuthenticatedFridayShell(
                     onOpenRemoteSettings = { navigateToTab(ROUTE_REMOTE_SETTINGS) },
                     quickCommands = quickCommands,
                     onSaveQuickCommand = viewModel::saveQuickCommand,
-                    onDeleteQuickCommand = viewModel::deleteQuickCommand
+                    onDeleteQuickCommand = viewModel::deleteQuickCommand,
+                    onSelectFileChunk = viewModel::selectLoadedFileChunk
                 )
             }
 

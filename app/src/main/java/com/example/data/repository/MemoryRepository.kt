@@ -20,10 +20,12 @@ import com.example.data.model.ChatMessage
 import com.example.data.model.LanguageMode
 import com.example.data.model.LearningNote
 import com.example.data.model.NoteCategory
+import com.example.data.model.OfflineMigrationSummary
 import com.example.data.model.SyncStatusState
 import com.example.data.model.TerminalEnvironment
 import com.example.data.model.TerminalExecutionStatus
 import com.example.data.model.TerminalLog
+import com.example.data.model.YouTubeVideoSummary
 import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.auth
@@ -276,6 +278,32 @@ class MemoryRepository(
         )
     }
 
+    suspend fun saveYouTubeLearningRecord(
+        userId: String,
+        video: YouTubeVideoSummary
+    ) {
+        val cleanId = video.videoId.trim().ifBlank { video.url.hashCode().toString() }
+        val key = LearningRecordEntity.key(userId, LearningRecordEntity.TYPE_YOUTUBE, cleanId)
+        dao.upsertLearningRecord(
+            LearningRecordEntity(
+                id = key,
+                userId = userId,
+                recordType = LearningRecordEntity.TYPE_YOUTUBE,
+                itemId = cleanId,
+                completed = video.transcriptAvailable,
+                updatedAtMillis = System.currentTimeMillis(),
+                title = CredentialRedactor.redact(video.title.trim()).take(160),
+                sourceUrl = video.url.trim().take(400),
+                summary = CredentialRedactor.redact(video.transcriptExcerpt.trim()).take(1200)
+            )
+        )
+    }
+
+    suspend fun getRecentYouTubeLearningRecords(userId: String): List<LearningRecordEntity> =
+        dao.getAllLearningRecordsForUser(userId)
+            .filter { it.recordType == LearningRecordEntity.TYPE_YOUTUBE }
+            .sortedByDescending { it.updatedAtMillis }
+
     suspend fun saveNote(
         title: String,
         content: String,
@@ -475,6 +503,7 @@ class MemoryRepository(
         val keywords = query.lowercase().split(Regex("\\s+")).filter { it.length >= 2 }
         val notes = dao.getRecentNotes(userId, limit = 30).filterNot { it.pendingDelete }
         val chats = dao.getRecentChatMessages(userId, limit = 30).filterNot { it.pendingDelete }
+        val ytRecords = getRecentYouTubeLearningRecords(userId)
 
         val matchedNotes = if (keywords.isEmpty()) notes.take(5) else {
             notes.filter { note ->
@@ -488,15 +517,27 @@ class MemoryRepository(
                 keywords.any { hay.contains(it) }
             }.takeLast(5)
         }
+        val matchedYouTube = if (keywords.isEmpty()) ytRecords.take(3) else {
+            ytRecords.filter { rec ->
+                val hay = "${rec.title} ${rec.summary}".lowercase()
+                keywords.any { hay.contains(it) }
+            }.take(3)
+        }
 
-        if (matchedNotes.isEmpty() && matchedChats.isEmpty()) {
-            return "No matching local notes or recent chat records found for '$query'."
+        if (matchedNotes.isEmpty() && matchedChats.isEmpty() && matchedYouTube.isEmpty()) {
+            return "No matching local notes, YouTube records, or recent chat records found for '$query'."
         }
         return buildString {
             if (matchedNotes.isNotEmpty()) {
                 appendLine("=== Local FRIDAY Notes ===")
                 matchedNotes.forEach { n ->
                     appendLine("- [${n.category}] ${n.title}: ${n.content.take(350)}")
+                }
+            }
+            if (matchedYouTube.isNotEmpty()) {
+                appendLine("=== Saved YouTube Learning Records ===")
+                matchedYouTube.forEach { y ->
+                    appendLine("- ${y.title} (${y.sourceUrl}): ${y.summary.take(280)}")
                 }
             }
             if (matchedChats.isNotEmpty()) {
@@ -506,6 +547,177 @@ class MemoryRepository(
                 }
             }
         }.trim()
+    }
+
+    /**
+     * Retrieves focused conversation history strictly isolated to [agentType] for [userId].
+     * Returns most recent turns + keyword-matched prior turns within a compact budget so
+     * agents stay coherent without bleeding across other agents or bloating prompt RAM.
+     */
+    suspend fun getScopedAgentHistory(
+        userId: String,
+        agentType: AgentType,
+        currentQuery: String,
+        maxTurns: Int = 6
+    ): List<Pair<String, String>> {
+        val recent = dao.getRecentMessagesForAgent(userId, agentType.name, limit = 24)
+            .filterNot { it.pendingDelete }
+            .sortedBy { it.createdAtMillis }
+        if (recent.isEmpty()) return emptyList()
+
+        val tailIds = recent.takeLast(maxTurns).map { it.id }.toSet()
+        val keywords = currentQuery.lowercase().split(Regex("\\s+")).filter { it.length >= 3 }.toSet()
+        val relevantEarlier = if (keywords.isEmpty()) emptyList() else {
+            recent.filter { msg ->
+                msg.id !in tailIds && keywords.any { kw -> msg.content.lowercase().contains(kw) }
+            }.takeLast(2)
+        }
+        val combined = (relevantEarlier + recent.takeLast(maxTurns)).distinctBy { it.id }
+        return combined.map { it.role to it.content.take(900) }
+    }
+
+    // --- Consent-Gated Offline -> Signed-In Account Migration ---
+    suspend fun inspectOfflineMigrationCandidate(targetUserId: String): OfflineMigrationSummary {
+        if (targetUserId.isBlank() || targetUserId == LOCAL_OFFLINE_USER_ID) {
+            return OfflineMigrationSummary()
+        }
+        val signedUid = auth?.currentUser?.uid
+        if (signedUid != null && signedUid != targetUserId) {
+            return OfflineMigrationSummary()
+        }
+        val notes = dao.getAllActiveNotesForUser(LOCAL_OFFLINE_USER_ID)
+        val chats = dao.getAllActiveMessagesForUser(LOCAL_OFFLINE_USER_ID)
+        val learning = dao.getAllLearningRecordsForUser(LOCAL_OFFLINE_USER_ID)
+        val logs = dao.getAllTerminalLogsForUser(LOCAL_OFFLINE_USER_ID)
+        val total = notes.size + chats.size + learning.size + logs.size
+        return OfflineMigrationSummary(
+            hasPendingPrompt = total > 0,
+            offlineNotesCount = notes.size,
+            offlineChatCount = chats.size,
+            offlineLearningCount = learning.size,
+            offlineTerminalLogsCount = logs.size
+        )
+    }
+
+    /**
+     * Migrates offline data under `LOCAL_OFFLINE_USER_ID` into [targetUserId] ONLY when:
+     * - [explicitUserConsent] is true
+     * - [targetUserId] matches the authenticated Firebase user (never leaks across accounts)
+     * - Deduplicates by both document ID and normalized content fingerprint (idempotent)
+     * - Runs inside a Room transaction so original offline records are untouched on failure.
+     */
+    suspend fun migrateOfflineDataWithConsent(
+        targetUserId: String,
+        explicitUserConsent: Boolean,
+        includeLocalTerminalLogs: Boolean = true,
+        clearSourceAfterCopy: Boolean = true
+    ): Result<Int> {
+        if (!explicitUserConsent) {
+            return Result.failure(
+                IllegalStateException("User consent is required before migrating local offline records.")
+            )
+        }
+        if (targetUserId.isBlank() || targetUserId == LOCAL_OFFLINE_USER_ID) {
+            return Result.failure(IllegalArgumentException("A valid signed-in account UID is required."))
+        }
+        val signedUid = auth?.currentUser?.uid
+        if (signedUid != null && signedUid != targetUserId) {
+            return Result.failure(
+                SecurityException("Cross-user migration blocked: authenticated UID mismatch.")
+            )
+        }
+
+        return try {
+            val offlineNotes = dao.getAllActiveNotesForUser(LOCAL_OFFLINE_USER_ID)
+            val existingNotes = dao.getAllActiveNotesForUser(targetUserId)
+            val existingNoteIds = existingNotes.map { it.id }.toSet()
+            val existingNoteFingerprints = existingNotes.map {
+                "${it.category}::${it.title.trim().lowercase()}::${it.content.trim()}"
+            }.toSet()
+
+            val notesToInsert = offlineNotes.filterNot { src ->
+                val fp = "${src.category}::${src.title.trim().lowercase()}::${src.content.trim()}"
+                src.id in existingNoteIds || fp in existingNoteFingerprints
+            }.map { src ->
+                src.copy(
+                    userId = targetUserId,
+                    pendingSync = canCloudSync(targetUserId),
+                    pendingDelete = false
+                )
+            }
+
+            val offlineChats = dao.getAllActiveMessagesForUser(LOCAL_OFFLINE_USER_ID)
+            val existingChats = dao.getAllActiveMessagesForUser(targetUserId)
+            val existingChatIds = existingChats.map { it.id }.toSet()
+            val existingChatFingerprints = existingChats.map {
+                "${it.role}::${it.agentType}::${it.createdAtMillis}::${it.content.trim()}"
+            }.toSet()
+
+            val chatsToInsert = offlineChats.filterNot { src ->
+                val fp = "${src.role}::${src.agentType}::${src.createdAtMillis}::${src.content.trim()}"
+                src.id in existingChatIds || fp in existingChatFingerprints
+            }.map { src ->
+                src.copy(
+                    userId = targetUserId,
+                    pendingSync = canCloudSync(targetUserId),
+                    pendingDelete = false
+                )
+            }
+
+            val offlineRecords = dao.getAllLearningRecordsForUser(LOCAL_OFFLINE_USER_ID)
+            val existingRecordsByItem = dao.getAllLearningRecordsForUser(targetUserId)
+                .associateBy { "${it.recordType}::${it.itemId}" }
+
+            val recordsToInsert = offlineRecords.mapNotNull { src ->
+                val targetKey = LearningRecordEntity.key(targetUserId, src.recordType, src.itemId)
+                val existing = existingRecordsByItem["${src.recordType}::${src.itemId}"]
+                when {
+                    existing == null -> src.copy(id = targetKey, userId = targetUserId)
+                    !existing.completed && src.completed -> existing.copy(
+                        completed = true,
+                        updatedAtMillis = maxOf(existing.updatedAtMillis, src.updatedAtMillis)
+                    )
+                    else -> null
+                }
+            }
+
+            val offlineLogs = if (includeLocalTerminalLogs) {
+                dao.getAllTerminalLogsForUser(LOCAL_OFFLINE_USER_ID)
+            } else {
+                emptyList()
+            }
+            val existingLogs = dao.getAllTerminalLogsForUser(targetUserId)
+            val existingLogIds = existingLogs.map { it.id }.toSet()
+            val existingLogFingerprints = existingLogs.map {
+                "${it.environment}::${it.createdAtMillis}::${it.command}"
+            }.toSet()
+
+            val logsToInsert = offlineLogs.filterNot { src ->
+                val fp = "${src.environment}::${src.createdAtMillis}::${src.command}"
+                src.id in existingLogIds || fp in existingLogFingerprints
+            }.map { src ->
+                // Preserve strictly local-only flag; never upload terminal logs to cloud
+                src.copy(userId = targetUserId, localOnly = true)
+            }
+
+            dao.applyOfflineMigrationTransaction(
+                sourceUserId = LOCAL_OFFLINE_USER_ID,
+                notesToInsert = notesToInsert,
+                messagesToInsert = chatsToInsert,
+                recordsToInsert = recordsToInsert,
+                logsToInsert = logsToInsert,
+                clearSourceAfterCopy = clearSourceAfterCopy
+            )
+
+            val migratedTotal = notesToInsert.size + chatsToInsert.size + recordsToInsert.size + logsToInsert.size
+            triggerBackgroundSync(targetUserId)
+            Result.success(migratedTotal)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Offline data migration failed; original offline data preserved safely", e)
+            Result.failure(e)
+        }
     }
 
     private fun triggerBackgroundSync(userId: String) {

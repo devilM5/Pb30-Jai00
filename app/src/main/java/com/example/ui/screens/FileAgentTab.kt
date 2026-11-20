@@ -43,6 +43,8 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.core.ProjectFileHelper
+import com.example.core.VaultLifecycleGuard
 import com.example.data.model.LoadedProjectFile
 import com.example.data.model.NoteCategory
 import com.example.data.model.ProposedFilePatch
@@ -62,6 +64,7 @@ fun FileAgentTab(
     fileAnalysisState: UiState<String>,
     proposedPatch: ProposedFilePatch?,
     onFilePicked: (Uri) -> Unit,
+    onSelectChunk: (Int) -> Unit = {},
     onAnalyzeFile: (String) -> Unit,
     onSendToCodingEditor: (String) -> Unit,
     onStageEditProposal: (String, String) -> Unit,
@@ -77,12 +80,14 @@ fun FileAgentTab(
     val openDocumentLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
+        VaultLifecycleGuard.clearExternalFlow()
         if (uri != null) onFilePicked(uri)
     }
 
     val saveCopyLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument(loadedFile?.mimeType ?: "text/plain")
     ) { uri ->
+        VaultLifecycleGuard.clearExternalFlow()
         if (uri != null) onApproveAndSavePatch(uri)
     }
 
@@ -95,7 +100,7 @@ fun FileAgentTab(
     ) {
         item {
             SecurityDisclaimerBanner(
-                text = "Zero-permission Storage Access Framework: Pick code, configs, or logs safely. File edits require explicit approval.",
+                text = "Zero-permission Storage Access Framework: Pick code, configs, logs, or selectable PDFs safely. File edits require explicit approval.",
                 isSimulated = false
             )
         }
@@ -103,7 +108,10 @@ fun FileAgentTab(
         item {
             CyberHudCard(accentColor = NeonCyan) {
                 Button(
-                    onClick = { openDocumentLauncher.launch(arrayOf("*/*")) },
+                    onClick = {
+                        VaultLifecycleGuard.markExternalFlowLaunched()
+                        openDocumentLauncher.launch(arrayOf("*/*"))
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = NeonCyan, contentColor = Color.Black),
                     modifier = Modifier
                         .fillMaxWidth()
@@ -123,17 +131,68 @@ fun FileAgentTab(
                         Column {
                             Text(loadedFile.fileName, style = MaterialTheme.typography.titleMedium, color = Color.White)
                             Text(
-                                text = "${loadedFile.mimeType} • ${loadedFile.sizeBytes} bytes" +
-                                    if (loadedFile.truncated) " (Truncated preview)" else "",
+                                text = "${loadedFile.mimeType} • ${loadedFile.sizeBytes} bytes • ${loadedFile.encodingLabel}",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = if (loadedFile.truncated) CyberAmber else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
+
+                    loadedFile.partialReadWarning?.let { warning ->
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = warning,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = CyberAmber,
+                            modifier = Modifier.testTag("file_partial_read_warning")
+                        )
+                    }
+
+                    if (loadedFile.chunksCount > 1) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = { onSelectChunk((loadedFile.currentChunkIndex - 1).coerceAtLeast(0)) },
+                                enabled = loadedFile.currentChunkIndex > 0,
+                                modifier = Modifier.testTag("file_prev_chunk_button")
+                            ) {
+                                Text("Prev Chunk")
+                            }
+                            Text(
+                                text = "Chunk ${loadedFile.currentChunkIndex + 1} / ${loadedFile.chunksCount}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = NeonCyan,
+                                modifier = Modifier.testTag("file_chunk_indicator")
+                            )
+                            OutlinedButton(
+                                onClick = {
+                                    onSelectChunk((loadedFile.currentChunkIndex + 1).coerceAtMost(loadedFile.chunksCount - 1))
+                                },
+                                enabled = loadedFile.currentChunkIndex < loadedFile.chunksCount - 1,
+                                modifier = Modifier.testTag("file_next_chunk_button")
+                            ) {
+                                Text("Next Chunk")
+                            }
+                        }
+                    }
+
+                    val displayedPreview = if (loadedFile.chunksCount > 1) {
+                        ProjectFileHelper.getChunk(loadedFile.content, loadedFile.currentChunkIndex)
+                    } else {
+                        editableDraft
+                    }
+
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
-                        value = editableDraft,
-                        onValueChange = { editableDraft = it },
+                        value = displayedPreview,
+                        onValueChange = {
+                            if (loadedFile.chunksCount == 1) editableDraft = it
+                        },
+                        readOnly = loadedFile.chunksCount > 1,
                         textStyle = MonoCodeStyle,
                         minLines = 6,
                         maxLines = 12,
@@ -213,7 +272,10 @@ fun FileAgentTab(
                             Text("Approve & Save")
                         }
                         OutlinedButton(
-                            onClick = { saveCopyLauncher.launch("edited_${proposedPatch.fileName}") },
+                            onClick = {
+                                VaultLifecycleGuard.markExternalFlowLaunched()
+                                saveCopyLauncher.launch("edited_${proposedPatch.fileName}")
+                            },
                             modifier = Modifier.weight(1f)
                         ) {
                             Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(16.dp))

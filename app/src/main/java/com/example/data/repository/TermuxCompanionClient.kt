@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
+import com.example.core.CommandPolicyValidator
 import com.example.core.CredentialRedactor
 import com.example.core.TermuxCommandReceiver
 import com.example.core.TermuxExecutionCallbacks
@@ -189,9 +190,25 @@ class TermuxCompanionClient(
     suspend fun executeApprovedCommand(
         state: TermuxEnvironmentState,
         command: String,
-        timeoutSeconds: Int
+        timeoutSeconds: Int,
+        approvedByUser: Boolean = false
     ): BridgeExecutionResult {
         val started = System.currentTimeMillis()
+        val policyError = CommandPolicyValidator.verifyExecutionAuthorization(
+            rawCommand = command,
+            environment = TerminalEnvironment.TERMUX_BRIDGE,
+            approvedByUser = approvedByUser
+        )
+        if (policyError != null) {
+            return BridgeExecutionResult(
+                executed = false,
+                status = TerminalExecutionStatus.BLOCKED,
+                exitCode = -1,
+                stdout = "",
+                stderr = policyError,
+                environment = TerminalEnvironment.TERMUX_BRIDGE
+            )
+        }
         if (!state.isConnected) {
             return BridgeExecutionResult(
                 executed = false,
@@ -211,7 +228,8 @@ class TermuxCompanionClient(
                             command = command,
                             environment = TerminalEnvironment.TERMUX_BRIDGE,
                             endpointUrl = state.companionUrl,
-                            sessionToken = state.companionToken
+                            sessionToken = state.companionToken,
+                            approvedByUser = approvedByUser
                         ).copy(executionTimeMillis = System.currentTimeMillis() - started)
                     }
                 } catch (_: TimeoutCancellationException) {

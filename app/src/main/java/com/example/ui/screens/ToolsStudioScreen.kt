@@ -108,7 +108,8 @@ fun ToolsStudioScreen(
     onOpenRemoteSettings: () -> Unit = {},
     quickCommands: List<QuickCommandItem> = QuickCommandStore.defaultCommands(),
     onSaveQuickCommand: (String, String) -> Unit = { _, _ -> },
-    onDeleteQuickCommand: (String) -> Unit = {}
+    onDeleteQuickCommand: (String) -> Unit = {},
+    onSelectFileChunk: (Int) -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -225,6 +226,7 @@ fun ToolsStudioScreen(
                 fileAnalysisState = fileAnalysisState,
                 proposedPatch = proposedPatch,
                 onFilePicked = onFilePicked,
+                onSelectChunk = onSelectFileChunk,
                 onAnalyzeFile = onAnalyzeFile,
                 onSendToCodingEditor = { code ->
                     onSendToCodingEditor(code)

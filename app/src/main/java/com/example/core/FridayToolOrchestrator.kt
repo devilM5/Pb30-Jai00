@@ -68,6 +68,7 @@ class FridayToolOrchestrator(
             val yt = webToolsRepository.searchYouTubeAndTranscripts(detectedUrl, maxVideos = 1)
             yt.onSuccess { videos ->
                 videos.forEach { v ->
+                    memoryRepository.saveYouTubeLearningRecord(currentUserId, v)
                     citations += WebCitation("YouTube: ${v.title}", v.url)
                     traces += ToolExecutionTrace("youtube_transcript", v.title, listOf(v.url))
                     preObservations += "YouTube Video '${v.title}' by ${v.channel}\nURL: ${v.url}\nTranscript (${if (v.transcriptAvailable) "Available" else "Unavailable"}):\n${v.transcriptExcerpt.take(2200)}"
@@ -87,17 +88,24 @@ class FridayToolOrchestrator(
                     traces += ToolExecutionTrace("fetch_website", "Blocked/Failed: ${err.localizedMessage}")
                     preObservations += "Website fetch failed: ${err.localizedMessage}"
                 }
-        } else if (lower.contains("youtube") || lower.contains("transcript")) {
-            val ytQuery = userPrompt.replace(Regex("""(?i)\b(youtube|search|transcript|find)\b"""), "").trim().ifBlank { userPrompt }
+        } else if (shouldTriggerYouTubeSearch(lower)) {
+            val ytQuery = extractCleanYouTubeQuery(userPrompt)
             webToolsRepository.searchYouTubeAndTranscripts(ytQuery, maxVideos = 3)
                 .onSuccess { videos ->
-                    videos.forEach { citations += WebCitation("YouTube: ${it.title}", it.url) }
+                    videos.forEach {
+                        memoryRepository.saveYouTubeLearningRecord(currentUserId, it)
+                        citations += WebCitation("YouTube: ${it.title}", it.url)
+                    }
                     if (videos.isNotEmpty()) {
                         traces += ToolExecutionTrace("youtube_search", "${videos.size} video(s) retrieved", videos.map { it.url })
                         preObservations += videos.joinToString("\n") { v ->
                             "- ${v.title} (${v.channel}) ${v.url}\n  Transcript: ${v.transcriptExcerpt.take(1000)}"
                         }
                     }
+                }
+                .onFailure { err ->
+                    traces += ToolExecutionTrace("youtube_search", "Offline/Failed: ${err.localizedMessage}")
+                    preObservations += "YouTube search failed: ${err.localizedMessage}"
                 }
         } else if (shouldTriggerWebSearch(lower)) {
             webToolsRepository.searchWeb(userPrompt, maxResults = 4)
@@ -135,6 +143,7 @@ class FridayToolOrchestrator(
         if (!modelInstalled || !nativeReady) {
             val honestFallback = buildUnavailableModelResponse(
                 userPrompt = userPrompt,
+                languageMode = languageMode,
                 modelInstalled = modelInstalled,
                 nativeReady = nativeReady,
                 observations = preObservations,
@@ -214,13 +223,22 @@ class FridayToolOrchestrator(
             dynamicObservations += "[${call.name}] $obs"
         }
 
+        val languageReminder = when (languageMode) {
+            LanguageMode.HINDI ->
+                "Synthesize a clear, accurate final answer in natural Hindi (Devanagari script) grounded in the tool observations above."
+            LanguageMode.HINGLISH ->
+                "Synthesize a clear, accurate final answer in crisp Roman Hinglish (Hindi + English tech terms) grounded in the tool observations above."
+            LanguageMode.ENGLISH ->
+                "Synthesize a complete, accurate final answer in clean English grounded in the tool observations above."
+        }
+
         val secondPassPrompt = """
             $userPrompt
 
             Tool Observations:
             ${(preObservations + dynamicObservations).joinToString("\n\n")}
 
-            Synthesize your complete, accurate answer using the tool observations above.
+            $languageReminder
         """.trimIndent()
 
         val rawSecondPass = StringBuilder()
@@ -300,7 +318,10 @@ class FridayToolOrchestrator(
                 val q = call.arguments["query"].orEmpty()
                 webToolsRepository.searchYouTubeAndTranscripts(q, maxVideos = 2).fold(
                     onSuccess = { videos ->
-                        videos.forEach { citations += WebCitation("YouTube: ${it.title}", it.url) }
+                        videos.forEach {
+                            memoryRepository.saveYouTubeLearningRecord(currentUserId, it)
+                            citations += WebCitation("YouTube: ${it.title}", it.url)
+                        }
                         traces += ToolExecutionTrace("youtube_search", "${videos.size} video(s)", videos.map { it.url })
                         videos.joinToString("\n") {
                             "${it.title} (${it.url}) — Transcript: ${it.transcriptExcerpt.take(1200)}"
@@ -369,26 +390,57 @@ class FridayToolOrchestrator(
 
     private fun buildUnavailableModelResponse(
         userPrompt: String,
+        languageMode: LanguageMode,
         modelInstalled: Boolean,
         nativeReady: Boolean,
         observations: List<String>,
         citations: List<WebCitation>
     ): String = buildString {
-        if (!modelInstalled) {
-            appendLine("Local AI model `dhir-2b-Q4_K_M.gguf` is not installed yet.")
-            appendLine("Open the Dhīr Engine Manager (Dashboard or Tools Studio) to import `dhir-2b-Q4_K_M.gguf` from phone storage or download it via HTTPS.")
-        } else if (!nativeReady) {
-            appendLine("`dhir-2b-Q4_K_M.gguf` is installed, but native `libfriday_llama.so` is unavailable on this runtime.")
-        }
-        if (observations.isNotEmpty()) {
-            appendLine()
-            appendLine("Meanwhile, FRIDAY executed the requested real tools for \"$userPrompt\":")
-            appendLine(observations.joinToString("\n\n"))
+        when (languageMode) {
+            LanguageMode.HINDI -> {
+                if (!modelInstalled) {
+                    appendLine("स्थानीय AI मॉडल `dhir-2b-Q4_K_M.gguf` अभी इंस्टॉल नहीं है।")
+                    appendLine("ऑफ़लाइन उत्तरों के लिए Dashboard या Tools Studio में Dhīr Engine Manager खोलें और फोन से `dhir-2b-Q4_K_M.gguf` इम्पोर्ट या HTTPS से डाउनलोड करें।")
+                } else if (!nativeReady) {
+                    appendLine("`dhir-2b-Q4_K_M.gguf` इंस्टॉल है, लेकिन इस डिवाइस/रनटाइम पर नेटिव `libfriday_llama.so` उपलब्ध नहीं है।")
+                }
+                if (observations.isNotEmpty()) {
+                    appendLine()
+                    appendLine("इसी बीच FRIDAY ने आपके अनुरोध \"$userPrompt\" के लिए वास्तविक टूल्स से यह जानकारी प्राप्त की:")
+                    appendLine(observations.joinToString("\n\n"))
+                }
+            }
+            LanguageMode.HINGLISH -> {
+                if (!modelInstalled) {
+                    appendLine("Local AI model `dhir-2b-Q4_K_M.gguf` abhi phone par installed nahi hai.")
+                    appendLine("Offline on-device answers ke liye Dashboard ya Tools Studio mein Dhīr Engine Manager khol kar `dhir-2b-Q4_K_M.gguf` import ya HTTPS se download karein.")
+                } else if (!nativeReady) {
+                    appendLine("`dhir-2b-Q4_K_M.gguf` installed hai, lekin is runtime par native `libfriday_llama.so` available nahi hai.")
+                }
+                if (observations.isNotEmpty()) {
+                    appendLine()
+                    appendLine("Is dauran FRIDAY ne \"$userPrompt\" ke liye real tools se ye output nikala hai:")
+                    appendLine(observations.joinToString("\n\n"))
+                }
+            }
+            LanguageMode.ENGLISH -> {
+                if (!modelInstalled) {
+                    appendLine("Local AI model `dhir-2b-Q4_K_M.gguf` is not installed yet.")
+                    appendLine("Open the Dhīr Engine Manager (Dashboard or Tools Studio) to import `dhir-2b-Q4_K_M.gguf` from phone storage or download it via HTTPS.")
+                } else if (!nativeReady) {
+                    appendLine("`dhir-2b-Q4_K_M.gguf` is installed, but native `libfriday_llama.so` is unavailable on this runtime.")
+                }
+                if (observations.isNotEmpty()) {
+                    appendLine()
+                    appendLine("Meanwhile, FRIDAY executed the requested real tools for \"$userPrompt\":")
+                    appendLine(observations.joinToString("\n\n"))
+                }
+            }
         }
         val cleanCites = citations.distinctBy { it.url }
         if (cleanCites.isNotEmpty()) {
             appendLine()
-            appendLine("Sources:")
+            appendLine(if (languageMode == LanguageMode.HINDI) "स्रोत:" else "Sources:")
             cleanCites.forEach { appendLine("- ${it.title}: ${it.url}") }
         }
     }.trim()
@@ -405,7 +457,22 @@ class FridayToolOrchestrator(
         }.trim()
     }
 
-    private fun shouldTriggerWebSearch(lower: String): Boolean =
+    internal fun shouldTriggerYouTubeSearch(lower: String): Boolean =
+        lower.contains("youtube") ||
+            lower.contains("transcript") ||
+            lower.contains("यूट्यूब") ||
+            lower.contains("ट्रांसक्रिप्ट") ||
+            Regex("""\byt\s+""").containsMatchIn(lower)
+
+    internal fun extractCleanYouTubeQuery(rawPrompt: String): String =
+        rawPrompt
+            .replace(Regex("""(?i)\b(youtube|yt|search|transcript|find|video|videos|karo|dhundo|nikalo|batao|dikhao|par|pe|mein|me)\b"""), "")
+            .replace(Regex("""(यूट्यूब|वीडियो|खोजो|ट्रांसक्रिप्ट|पर|में)"""), "")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .ifBlank { rawPrompt.trim() }
+
+    internal fun shouldTriggerWebSearch(lower: String): Boolean =
         lower.contains("search the web") ||
             lower.contains("search the internet") ||
             lower.contains("search online") ||
@@ -413,22 +480,46 @@ class FridayToolOrchestrator(
             lower.contains("cve-20") ||
             lower.startsWith("search ") ||
             lower.contains("google ") ||
-            lower.contains("web research")
+            lower.contains("web research") ||
+            lower.contains("search karo") ||
+            lower.contains("online khojo") ||
+            lower.contains("internet par") ||
+            lower.contains("web par") ||
+            lower.contains("khajo") ||
+            lower.contains("khojo") ||
+            lower.contains("इंटरनेट") ||
+            lower.contains("वेब सर्च") ||
+            lower.contains("ऑनलाइन खोज")
 
-    private fun shouldLookupMemory(lower: String): Boolean =
+    internal fun shouldLookupMemory(lower: String): Boolean =
         lower.contains("my note") ||
             lower.contains("saved note") ||
             lower.contains("remember") ||
             lower.contains("chat history") ||
             lower.contains("previous note") ||
-            lower.contains("memory")
+            lower.contains("memory") ||
+            lower.contains("mere notes") ||
+            lower.contains("saved notes") ||
+            lower.contains("purani chat") ||
+            lower.contains("yaad") ||
+            lower.contains("नोट्स") ||
+            lower.contains("मेमोरी") ||
+            lower.contains("पिछली चैट") ||
+            lower.contains("याद")
 
-    private fun shouldInspectEnvironments(lower: String): Boolean =
+    internal fun shouldInspectEnvironments(lower: String): Boolean =
         lower.contains("termux status") ||
             lower.contains("ssh status") ||
             lower.contains("environment status") ||
             lower.contains("system status") ||
             lower.contains("sync status") ||
             lower.contains("model status") ||
-            lower.contains("tools installed")
+            lower.contains("tools installed") ||
+            lower.contains("termux connected") ||
+            lower.contains("ssh connected") ||
+            lower.contains("termux connect") ||
+            lower.contains("ssh connect") ||
+            lower.contains("टर्मक्स स्टेटस") ||
+            lower.contains("सिंक स्टेटस") ||
+            lower.contains("मॉडल स्टेटस")
 }

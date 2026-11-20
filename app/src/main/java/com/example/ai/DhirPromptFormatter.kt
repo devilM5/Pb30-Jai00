@@ -87,6 +87,41 @@ object DhirPromptFormatter {
         append(NOTHINK_TAG)
     }
 
+    /**
+     * Fits conversation turns inside [contextSizeTokens] minus [reserveOutputTokens] and
+     * the system prompt / tool schema budget. NEVER truncates the system prompt or the latest user turn.
+     */
+    fun trimTurnsToBudget(
+        systemPrompt: String,
+        historyTurns: List<DhirTurn>,
+        currentUserTurn: DhirTurn,
+        toolsJson: String? = null,
+        contextSizeTokens: Int = 2048,
+        reserveOutputTokens: Int = 512
+    ): List<DhirTurn> {
+        val approxTokenBudget = (contextSizeTokens - reserveOutputTokens).coerceAtLeast(384)
+        // Conservative ~3.0 chars per token to guard multilingual Devanagari/Hinglish text
+        val maxTotalChars = approxTokenBudget * 3
+        val systemAndToolsChars = systemPrompt.length + (toolsJson?.length ?: 0) + 96
+        val currentChars = currentUserTurn.content.length + 32
+        var remainingHistoryChars = (maxTotalChars - systemAndToolsChars - currentChars).coerceAtLeast(0)
+
+        val keptHistory = mutableListOf<DhirTurn>()
+        for (turn in historyTurns.asReversed()) {
+            val turnLen = turn.content.length + 36
+            if (turnLen <= remainingHistoryChars) {
+                keptHistory += turn
+                remainingHistoryChars -= turnLen
+            } else if (keptHistory.isEmpty() && remainingHistoryChars >= 120) {
+                keptHistory += turn.copy(content = turn.content.take(remainingHistoryChars - 36))
+                break
+            } else {
+                break
+            }
+        }
+        return keptHistory.asReversed() + currentUserTurn
+    }
+
     fun parseToolCalls(rawOutput: String): List<ParsedToolCall> {
         return toolCallRegex.findAll(rawOutput).mapNotNull { match ->
             val jsonText = match.groupValues.getOrNull(1)?.trim().orEmpty()
@@ -107,9 +142,12 @@ object DhirPromptFormatter {
         }.toList()
     }
 
+    private val partialToolCallRegex = Regex("""<tool_call>[\s\S]*$""")
+
     fun cleanVisibleText(rawOutput: String): String {
         return rawOutput
             .replace(toolCallRegex, "")
+            .replace(partialToolCallRegex, "")
             .replace(NOTHINK_TAG, "")
             .replace(END_OF_TURN, "")
             .replace(BOS, "")

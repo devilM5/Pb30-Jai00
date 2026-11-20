@@ -30,6 +30,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.example.core.VaultLifecycleGuard
 import com.example.data.model.DhirModelState
 import com.example.data.model.DhirModelStatus
 
@@ -47,6 +48,7 @@ fun DhirModelStatusCard(
     val filePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
+        VaultLifecycleGuard.clearExternalFlow()
         if (uri != null) onImportModelUri(uri)
     }
 
@@ -137,7 +139,10 @@ fun DhirModelStatusCard(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
-                    onClick = { filePicker.launch(arrayOf("application/octet-stream", "*/*")) },
+                    onClick = {
+                        VaultLifecycleGuard.markExternalFlowLaunched()
+                        filePicker.launch(arrayOf("application/octet-stream", "*/*"))
+                    },
                     modifier = Modifier.weight(1f).testTag("dhir_import_gguf_button")
                 ) {
                     Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))

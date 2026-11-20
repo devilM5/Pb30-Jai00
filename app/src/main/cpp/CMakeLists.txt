@@ -24,7 +24,7 @@ set(GGML_CPU_KLEIDIAI OFF CACHE BOOL "" FORCE)
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
 
 if (CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
-    set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+    set(GGML_CPU_ARM_ARCH "armv8-a" CACHE STRING "" FORCE)
 endif()
 
 add_subdirectory(llama.cpp EXCLUDE_FROM_ALL)

@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -99,4 +100,65 @@ interface FridayDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertLearningRecord(record: LearningRecordEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertLearningRecords(records: List<LearningRecordEntity>)
+
+    // --- Per-Agent Conversation History ---
+    @Query(
+        "SELECT * FROM chat_messages WHERE userId = :userId AND agentType = :agentType AND pendingDelete = 0 " +
+            "ORDER BY createdAtMillis DESC LIMIT :limit"
+    )
+    suspend fun getRecentMessagesForAgent(userId: String, agentType: String, limit: Int = 24): List<ChatMessageEntity>
+
+    // --- Offline-to-Account Migration Helpers ---
+    @Query("SELECT * FROM notes WHERE userId = :userId AND pendingDelete = 0")
+    suspend fun getAllActiveNotesForUser(userId: String): List<LearningNoteEntity>
+
+    @Query("SELECT * FROM chat_messages WHERE userId = :userId AND pendingDelete = 0")
+    suspend fun getAllActiveMessagesForUser(userId: String): List<ChatMessageEntity>
+
+    @Query("SELECT * FROM learning_records WHERE userId = :userId")
+    suspend fun getAllLearningRecordsForUser(userId: String): List<LearningRecordEntity>
+
+    @Query("SELECT * FROM terminal_logs WHERE userId = :userId")
+    suspend fun getAllTerminalLogsForUser(userId: String): List<TerminalLogEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTerminalLogs(logs: List<TerminalLogEntity>)
+
+    @Query("DELETE FROM notes WHERE userId = :userId")
+    suspend fun deleteAllNotesForUser(userId: String)
+
+    @Query("DELETE FROM chat_messages WHERE userId = :userId")
+    suspend fun deleteAllChatMessagesForUser(userId: String)
+
+    @Query("DELETE FROM learning_records WHERE userId = :userId")
+    suspend fun deleteAllLearningRecordsForUser(userId: String)
+
+    @Query("DELETE FROM terminal_logs WHERE userId = :userId")
+    suspend fun deleteAllTerminalLogsForUser(userId: String)
+
+    @Transaction
+    suspend fun applyOfflineMigrationTransaction(
+        sourceUserId: String,
+        notesToInsert: List<LearningNoteEntity>,
+        messagesToInsert: List<ChatMessageEntity>,
+        recordsToInsert: List<LearningRecordEntity>,
+        logsToInsert: List<TerminalLogEntity>,
+        clearSourceAfterCopy: Boolean
+    ) {
+        if (notesToInsert.isNotEmpty()) upsertNotes(notesToInsert)
+        if (messagesToInsert.isNotEmpty()) upsertChatMessages(messagesToInsert)
+        if (recordsToInsert.isNotEmpty()) upsertLearningRecords(recordsToInsert)
+        if (logsToInsert.isNotEmpty()) insertTerminalLogs(logsToInsert)
+        if (clearSourceAfterCopy) {
+            deleteAllNotesForUser(sourceUserId)
+            deleteAllChatMessagesForUser(sourceUserId)
+            deleteAllLearningRecordsForUser(sourceUserId)
+            if (logsToInsert.isNotEmpty()) {
+                deleteAllTerminalLogsForUser(sourceUserId)
+            }
+        }
+    }
 }

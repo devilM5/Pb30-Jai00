@@ -1,19 +1,21 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
--->
+<?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="friday_remote_server_encrypted_prefs.xml" />
+        <exclude domain="sharedpref" path="friday_quick_commands_prefs.xml" />
+        <exclude domain="database" path="friday_local_vault.db" />
+        <exclude domain="database" path="friday_local_vault.db-wal" />
+        <exclude domain="database" path="friday_local_vault.db-shm" />
+        <exclude domain="file" path="models" />
+        <exclude domain="file" path="friday_ssh_known_hosts" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="friday_remote_server_encrypted_prefs.xml" />
+        <exclude domain="sharedpref" path="friday_quick_commands_prefs.xml" />
+        <exclude domain="database" path="friday_local_vault.db" />
+        <exclude domain="database" path="friday_local_vault.db-wal" />
+        <exclude domain="database" path="friday_local_vault.db-shm" />
+        <exclude domain="file" path="models" />
+        <exclude domain="file" path="friday_ssh_known_hosts" />
     </device-transfer>
-    -->
 </data-extraction-rules>

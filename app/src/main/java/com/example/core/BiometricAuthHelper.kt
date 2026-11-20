@@ -23,8 +23,32 @@ enum class BiometricSupportStatus {
 data class BiometricCheckResult(
     val status: BiometricSupportStatus,
     val detail: String,
-    val allowedAuthenticators: Int
+    val allowedAuthenticators: Int,
+    val useKeyguardCredentialFallback: Boolean = false
 )
+
+/**
+ * Tracks transient in-app external activity launches (SAF file pickers, Security Settings,
+ * Keyguard confirm intent, runtime permission dialogs) so ON_STOP does not falsely lock
+ * the vault while an approved system picker returns a URI.
+ */
+object VaultLifecycleGuard {
+    @Volatile
+    private var transientExternalFlowUntilMs: Long = 0L
+
+    fun markExternalFlowLaunched(graceWindowMs: Long = 90_000L) {
+        transientExternalFlowUntilMs = System.currentTimeMillis() + graceWindowMs
+    }
+
+    fun consumeOrIsWithinExternalFlow(): Boolean {
+        val now = System.currentTimeMillis()
+        return now <= transientExternalFlowUntilMs
+    }
+
+    fun clearExternalFlow() {
+        transientExternalFlowUntilMs = 0L
+    }
+}
 
 interface BiometricGateController {
     fun checkSupport(context: Context): BiometricCheckResult
@@ -39,37 +63,49 @@ interface BiometricGateController {
 
 object DefaultBiometricGateController : BiometricGateController {
 
-    private fun supportedAuthenticatorsForDevice(): Int =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+    internal fun supportedAuthenticatorsForSdk(sdkInt: Int = Build.VERSION.SDK_INT): Int =
+        if (sdkInt >= Build.VERSION_CODES.R) {
             BIOMETRIC_STRONG or DEVICE_CREDENTIAL
         } else {
-            BIOMETRIC_STRONG or BIOMETRIC_WEAK
+            // AndroidX Biometric prohibits BIOMETRIC_STRONG | DEVICE_CREDENTIAL below API 30;
+            // BIOMETRIC_WEAK | DEVICE_CREDENTIAL is the valid API 21-29 combination.
+            BIOMETRIC_WEAK or DEVICE_CREDENTIAL
         }
 
-    override fun checkSupport(context: Context): BiometricCheckResult {
-        val authenticators = supportedAuthenticatorsForDevice()
-        val biometricManager = BiometricManager.from(context)
-        val resultCode = biometricManager.canAuthenticate(authenticators)
-        val keyguardSecure = (context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)
-            ?.isDeviceSecure == true
+    internal fun evaluateSupport(
+        sdkInt: Int,
+        biometricCanAuthCode: Int,
+        keyguardDeviceSecure: Boolean,
+        hasKeyguardConfirmIntent: Boolean
+    ): BiometricCheckResult {
+        val authenticators = supportedAuthenticatorsForSdk(sdkInt)
 
-        return when (resultCode) {
+        return when (biometricCanAuthCode) {
             BiometricManager.BIOMETRIC_SUCCESS -> BiometricCheckResult(
                 status = BiometricSupportStatus.READY,
-                detail = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                detail = if (sdkInt >= Build.VERSION_CODES.R) {
                     "Biometric sensor & device credential protection active."
                 } else {
-                    "Biometric authentication hardware ready."
+                    "Biometric & device lock credential protection active."
                 },
-                allowedAuthenticators = authenticators
+                allowedAuthenticators = authenticators,
+                useKeyguardCredentialFallback = false
             )
 
             BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED -> {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && keyguardSecure) {
+                if (keyguardDeviceSecure && sdkInt >= Build.VERSION_CODES.R) {
                     BiometricCheckResult(
                         status = BiometricSupportStatus.READY,
                         detail = "Device lock screen credential active for vault unlock.",
-                        allowedAuthenticators = authenticators
+                        allowedAuthenticators = authenticators,
+                        useKeyguardCredentialFallback = false
+                    )
+                } else if (keyguardDeviceSecure && hasKeyguardConfirmIntent) {
+                    BiometricCheckResult(
+                        status = BiometricSupportStatus.READY,
+                        detail = "Device PIN, pattern, or password lock active for vault unlock.",
+                        allowedAuthenticators = DEVICE_CREDENTIAL,
+                        useKeyguardCredentialFallback = true
                     )
                 } else {
                     BiometricCheckResult(
@@ -80,11 +116,34 @@ object DefaultBiometricGateController : BiometricGateController {
                 }
             }
 
-            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> BiometricCheckResult(
-                status = BiometricSupportStatus.UNAVAILABLE,
-                detail = "Biometric hardware is temporarily unavailable.",
-                allowedAuthenticators = authenticators
-            )
+            BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE,
+            BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE -> {
+                if (keyguardDeviceSecure && sdkInt >= Build.VERSION_CODES.R) {
+                    BiometricCheckResult(
+                        status = BiometricSupportStatus.READY,
+                        detail = "Device lock screen credential active for vault unlock.",
+                        allowedAuthenticators = DEVICE_CREDENTIAL,
+                        useKeyguardCredentialFallback = false
+                    )
+                } else if (keyguardDeviceSecure && hasKeyguardConfirmIntent) {
+                    BiometricCheckResult(
+                        status = BiometricSupportStatus.READY,
+                        detail = "Hardware biometric absent; device PIN/pattern/password lock active.",
+                        allowedAuthenticators = DEVICE_CREDENTIAL,
+                        useKeyguardCredentialFallback = true
+                    )
+                } else {
+                    BiometricCheckResult(
+                        status = BiometricSupportStatus.UNAVAILABLE,
+                        detail = if (biometricCanAuthCode == BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE) {
+                            "Biometric hardware is temporarily unavailable."
+                        } else {
+                            "Biometric authentication hardware is unavailable and no screen lock credential is set."
+                        },
+                        allowedAuthenticators = authenticators
+                    )
+                }
+            }
 
             BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> BiometricCheckResult(
                 status = BiometricSupportStatus.UNAVAILABLE,
@@ -92,12 +151,49 @@ object DefaultBiometricGateController : BiometricGateController {
                 allowedAuthenticators = authenticators
             )
 
-            else -> BiometricCheckResult(
-                status = BiometricSupportStatus.UNAVAILABLE,
-                detail = "Biometric authentication is not available on this hardware.",
-                allowedAuthenticators = authenticators
-            )
+            else -> {
+                if (keyguardDeviceSecure && hasKeyguardConfirmIntent) {
+                    BiometricCheckResult(
+                        status = BiometricSupportStatus.READY,
+                        detail = "Device screen lock credential active for vault unlock.",
+                        allowedAuthenticators = DEVICE_CREDENTIAL,
+                        useKeyguardCredentialFallback = true
+                    )
+                } else {
+                    BiometricCheckResult(
+                        status = BiometricSupportStatus.UNAVAILABLE,
+                        detail = "Biometric authentication is not available on this hardware.",
+                        allowedAuthenticators = authenticators
+                    )
+                }
+            }
         }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun checkSupport(context: Context): BiometricCheckResult {
+        val sdkInt = Build.VERSION.SDK_INT
+        val authenticators = supportedAuthenticatorsForSdk(sdkInt)
+        val biometricManager = BiometricManager.from(context)
+        val resultCode = biometricManager.canAuthenticate(authenticators)
+        val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        val keyguardSecure = keyguardManager?.isDeviceSecure == true
+        val hasConfirmIntent = keyguardSecure &&
+            keyguardManager?.createConfirmDeviceCredentialIntent("FRIDAY", null) != null
+
+        return evaluateSupport(
+            sdkInt = sdkInt,
+            biometricCanAuthCode = resultCode,
+            keyguardDeviceSecure = keyguardSecure,
+            hasKeyguardConfirmIntent = hasConfirmIntent
+        )
+    }
+
+    @Suppress("DEPRECATION")
+    fun buildConfirmCredentialIntent(context: Context, title: String, subtitle: String): Intent? {
+        val keyguardManager = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager ?: return null
+        if (!keyguardManager.isDeviceSecure) return null
+        return keyguardManager.createConfirmDeviceCredentialIntent(title, subtitle)
     }
 
     override fun authenticate(

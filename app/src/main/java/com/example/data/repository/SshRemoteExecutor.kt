@@ -1,6 +1,7 @@
 package com.example.data.repository
 
 import android.content.Context
+import com.example.core.CommandPolicyValidator
 import com.example.core.CredentialRedactor
 import com.example.data.model.BridgeExecutionResult
 import com.example.data.model.SshAuthMethod
@@ -165,9 +166,25 @@ class SshRemoteExecutor(private val context: Context) {
     suspend fun executeCommand(
         profile: SshConnectionProfile,
         command: String,
-        timeoutSeconds: Int
+        timeoutSeconds: Int,
+        approvedByUser: Boolean = false
     ): BridgeExecutionResult = withContext(Dispatchers.IO) {
         val started = System.currentTimeMillis()
+        val policyError = CommandPolicyValidator.verifyExecutionAuthorization(
+            rawCommand = command,
+            environment = TerminalEnvironment.LINUX_SERVER_BRIDGE,
+            approvedByUser = approvedByUser
+        )
+        if (policyError != null) {
+            return@withContext BridgeExecutionResult(
+                executed = false,
+                status = TerminalExecutionStatus.BLOCKED,
+                exitCode = -1,
+                stdout = "",
+                stderr = policyError,
+                environment = TerminalEnvironment.LINUX_SERVER_BRIDGE
+            )
+        }
         val validationError = validateProfile(profile)
         if (validationError != null) {
             return@withContext BridgeExecutionResult(

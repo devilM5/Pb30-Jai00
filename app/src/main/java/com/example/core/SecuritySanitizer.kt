@@ -51,29 +51,48 @@ object CredentialRedactor {
 }
 
 /**
- * Validates terminal and Nmap commands against FRIDAY's safety and authorization rules.
+ * Validates terminal and Nmap commands against FRIDAY's safety and authorization rules
+ * using structural quote-aware shell tokenization rather than naive prefix checks.
  */
 object CommandPolicyValidator {
 
-    private val dangerousPatterns = listOf(
-        Regex("""(?i)\brm\s+-[a-zA-Z]*r[a-zA-Z]*f?\s+/(\s|$)"""),
-        Regex("""(?i):\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"""),
-        Regex("""(?i)\b(mkfs|wipefs|fdisk|parted)\b"""),
-        Regex("""(?i)\bdd\s+.*\bof=/dev/(sd|nvme|mmcblk|vd)"""),
-        Regex("""(?i)/etc/shadow"""),
-        Regex("""(?i)\bnc\b.*-e\s+/bin/(ba)?sh"""),
-        Regex("""(?i)/dev/tcp/"""),
-        Regex("""(?i)\b(sqlmap|hydra|medusa|metasploit|msfconsole|msfvenom)\b"""),
-        Regex("""(?i)--script\s*=?\s*(exploit|brute|dos|intrusive|malware|vuln)""")
+    private data class ShellParseResult(
+        val segments: List<String>,
+        val hasChainingOrBackground: Boolean,
+        val hasPipes: Boolean,
+        val hasCommandSubstitution: Boolean,
+        val hasRedirection: Boolean
     )
 
-    private val readOnlyPrefixes = listOf(
-        "ls", "pwd", "whoami", "id", "uname", "date", "uptime", "df", "free",
-        "ps", "ss", "ip ", "ifconfig", "ping ", "dig ", "nslookup", "cat ",
-        "head ", "tail ", "grep ", "which ", "command -v ", "for t in python3 bash nmap",
-        "python3 --version", "bash --version", "nmap --version", "node -v",
-        "java -version", "kotlinc -version"
+    private val dangerousCommandNames = setOf(
+        "mkfs", "mkfs.ext4", "mkfs.ext3", "mkfs.vfat", "mkfs.xfs",
+        "wipefs", "fdisk", "parted", "gdisk", "sfdisk", "shred",
+        "sudo", "su", "doas", "pkexec",
+        "sqlmap", "hydra", "medusa", "metasploit", "msfconsole", "msfvenom",
+        "ettercap", "responder", "mimikatz"
     )
+
+    private val fullCommandDangerousPatterns = listOf(
+        Regex("""(?i):\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?"""),
+        Regex("""(?i)/etc/shadow"""),
+        Regex("""(?i)/etc/sudoers"""),
+        Regex("""(?i)/dev/tcp/"""),
+        Regex("""(?i)/dev/udp/"""),
+        Regex("""(?i)\bnc(?:at)?\b.*(?:-e|-c)\s+/bin/(?:ba|z|da)?sh"""),
+        Regex("""(?i)\b(curl|wget|fetch)\b[\s\S]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b"""),
+        Regex("""(?i)\bdd\b.*\bof=/dev/(?:sd|nvme|mmcblk|vd|hd|loop)"""),
+        Regex("""(?i)--script\s*=?\s*(?:exploit|brute|dos|intrusive|malware|vuln)\b"""),
+        Regex("""(?i)>\s*>?\s*/(?:etc|boot|dev|sys|proc|root/\.ssh)/""")
+    )
+
+    private val readOnlyCommandAllowlist = setOf(
+        "ls", "pwd", "whoami", "id", "uname", "date", "uptime", "df", "free",
+        "ps", "ss", "ip", "ifconfig", "ping", "dig", "nslookup", "cat",
+        "head", "tail", "grep", "egrep", "wc", "sort", "uniq", "which", "echo"
+    )
+
+    private val diagnosticProbeExact =
+        "for t in python3 bash nmap; do command -v \"\$t\" >/dev/null 2>&1 && echo \"FRIDAY_TOOL:\$t=AVAILABLE\" || echo \"FRIDAY_TOOL:\$t=UNAVAILABLE\"; done"
 
     fun isPrivateOrLabTarget(target: String): Boolean {
         val clean = target.trim().lowercase()
@@ -97,6 +116,257 @@ object CommandPolicyValidator {
         return false
     }
 
+    /**
+     * Execution-layer mandatory defense-in-depth gate called inside Termux, SSH, and HTTP bridge executors.
+     * Prevents unapproved callers or bypassed UI flows from executing blocked or unapproved commands.
+     */
+    fun verifyExecutionAuthorization(
+        rawCommand: String,
+        environment: TerminalEnvironment,
+        approvedByUser: Boolean
+    ): String? {
+        if (!approvedByUser) {
+            return "Execution denied: explicit operator approval is required at the execution layer."
+        }
+        val check = evaluateCommand(rawCommand, environment)
+        if (check.isBlocked) {
+            return check.reason
+        }
+        return null
+    }
+
+    private fun parseShellStructure(command: String): ShellParseResult {
+        val segments = mutableListOf<String>()
+        val current = StringBuilder()
+        var inSingleQuote = false
+        var inDoubleQuote = false
+        var inBacktick = false
+        var escaped = false
+        var hasChaining = false
+        var hasPipes = false
+        var hasSubst = false
+        var hasRedir = false
+
+        var i = 0
+        while (i < command.length) {
+            val ch = command[i]
+            if (escaped) {
+                current.append(ch)
+                escaped = false
+                i++
+                continue
+            }
+            if (ch == '\\' && !inSingleQuote) {
+                current.append(ch)
+                escaped = true
+                i++
+                continue
+            }
+            if (ch == '\'' && !inDoubleQuote && !inBacktick) {
+                inSingleQuote = !inSingleQuote
+                current.append(ch)
+                i++
+                continue
+            }
+            if (ch == '"' && !inSingleQuote && !inBacktick) {
+                inDoubleQuote = !inDoubleQuote
+                current.append(ch)
+                i++
+                continue
+            }
+            if (ch == '`' && !inSingleQuote) {
+                inBacktick = !inBacktick
+                hasSubst = true
+                current.append(ch)
+                i++
+                continue
+            }
+
+            if (!inSingleQuote) {
+                if ((ch == '$' && i + 1 < command.length && command[i + 1] == '(') ||
+                    ((ch == '<' || ch == '>') && i + 1 < command.length && command[i + 1] == '(')
+                ) {
+                    hasSubst = true
+                }
+            }
+
+            if (!inSingleQuote && !inDoubleQuote && !inBacktick) {
+                when {
+                    ch == ';' || ch == '\n' || ch == '\r' -> {
+                        hasChaining = true
+                        if (current.isNotBlank()) segments += current.toString().trim()
+                        current.clear()
+                        i++
+                        continue
+                    }
+                    ch == '&' && i + 1 < command.length && command[i + 1] == '&' -> {
+                        hasChaining = true
+                        if (current.isNotBlank()) segments += current.toString().trim()
+                        current.clear()
+                        i += 2
+                        continue
+                    }
+                    ch == '|' && i + 1 < command.length && command[i + 1] == '|' -> {
+                        hasChaining = true
+                        if (current.isNotBlank()) segments += current.toString().trim()
+                        current.clear()
+                        i += 2
+                        continue
+                    }
+                    ch == '|' -> {
+                        hasPipes = true
+                        if (current.isNotBlank()) segments += current.toString().trim()
+                        current.clear()
+                        i++
+                        continue
+                    }
+                    ch == '&' -> {
+                        val isFdRedir = i > 0 && (command[i - 1] == '>' || command[i - 1] == '<')
+                        if (!isFdRedir) {
+                            hasChaining = true
+                            if (current.isNotBlank()) segments += current.toString().trim()
+                            current.clear()
+                            i++
+                            continue
+                        }
+                    }
+                    ch == '>' -> hasRedir = true
+                }
+            }
+            current.append(ch)
+            i++
+        }
+        if (current.isNotBlank()) {
+            segments += current.toString().trim()
+        }
+        return ShellParseResult(
+            segments = segments,
+            hasChainingOrBackground = hasChaining,
+            hasPipes = hasPipes,
+            hasCommandSubstitution = hasSubst,
+            hasRedirection = hasRedir
+        )
+    }
+
+    private fun tokenizeSegment(segment: String): List<String> {
+        val tokens = mutableListOf<String>()
+        val cur = StringBuilder()
+        var inSingle = false
+        var inDouble = false
+        var escaped = false
+        for (ch in segment) {
+            if (escaped) {
+                cur.append(ch)
+                escaped = false
+                continue
+            }
+            if (ch == '\\' && !inSingle) {
+                escaped = true
+                continue
+            }
+            if (ch == '\'' && !inDouble) {
+                inSingle = !inSingle
+                continue
+            }
+            if (ch == '"' && !inSingle) {
+                inDouble = !inDouble
+                continue
+            }
+            if (ch.isWhitespace() && !inSingle && !inDouble) {
+                if (cur.isNotEmpty()) {
+                    tokens += cur.toString()
+                    cur.clear()
+                }
+            } else {
+                cur.append(ch)
+            }
+        }
+        if (cur.isNotEmpty()) tokens += cur.toString()
+        return tokens
+    }
+
+    private fun normalizeExecutableName(rawToken: String): String {
+        val clean = rawToken.replace("\\", "").replace("\"", "").replace("'", "").trim()
+        return clean.substringAfterLast('/').lowercase()
+    }
+
+    private fun isDangerousRmSegment(tokens: List<String>): Boolean {
+        if (tokens.isEmpty() || normalizeExecutableName(tokens[0]) != "rm") return false
+        var hasRecursive = false
+        var hasForce = false
+        val targets = mutableListOf<String>()
+        for (t in tokens.drop(1)) {
+            if (t.startsWith("--")) {
+                when (t.lowercase()) {
+                    "--recursive" -> hasRecursive = true
+                    "--force" -> hasForce = true
+                    "--no-preserve-root" -> return true
+                }
+            } else if (t.startsWith("-") && t.length > 1) {
+                val flags = t.drop(1).lowercase()
+                if ('r' in flags) hasRecursive = true
+                if ('f' in flags) hasForce = true
+            } else {
+                targets += t.trim()
+            }
+        }
+        if (hasRecursive && hasForce && targets.isNotEmpty()) {
+            val criticalTargets = targets.any { tgt ->
+                tgt == "/" || tgt == "/*" || tgt == "~" || tgt == "~/" || tgt == ".." ||
+                    tgt.startsWith("/etc") || tgt.startsWith("/bin") || tgt.startsWith("/usr") ||
+                    tgt.startsWith("/system") || tgt.startsWith("/data") || tgt.startsWith("/boot")
+            }
+            if (criticalTargets || targets.any { it.contains("*") }) return true
+        }
+        return targets.any { it == "/" || it == "/*" }
+    }
+
+    private fun isDangerousSegment(tokens: List<String>): String? {
+        if (tokens.isEmpty()) return null
+        // Skip leading VAR=val env assignments
+        var idx = 0
+        while (idx < tokens.size && Regex("""^[A-Za-z_][A-Za-z0-9_]*=.*$""").matches(tokens[idx])) {
+            idx++
+        }
+        if (idx >= tokens.size) return null
+        val activeTokens = tokens.subList(idx, tokens.size)
+        val exe = normalizeExecutableName(activeTokens[0])
+
+        if (exe in dangerousCommandNames) {
+            return "Blocked by FRIDAY Security Policy: privileged, disk-wiping, or exploitation tool '$exe' is prohibited."
+        }
+        if (isDangerousRmSegment(activeTokens)) {
+            return "Blocked by FRIDAY Security Policy: destructive 'rm' targeting system/critical paths is prohibited."
+        }
+        if ((exe == "chmod" || exe == "chown") && activeTokens.any { it == "/" || it == "/*" || it == "777" || it == "+s" }) {
+            return "Blocked by FRIDAY Security Policy: unsafe recursive or world-writable permission change detected."
+        }
+        if (exe == "eval" || ((exe == "bash" || exe == "sh" || exe == "zsh" || exe == "dash") &&
+            activeTokens.any { it == "-c" || it == "-i" || it.startsWith("-c") })
+        ) {
+            return "Blocked by FRIDAY Security Policy: inline shell execution ('$exe -c' / 'eval') is prohibited."
+        }
+        if ((exe == "python" || exe == "python3" || exe == "perl") &&
+            activeTokens.any { it == "-c" || it == "-e" || it == "-i" }
+        ) {
+            val joined = activeTokens.joinToString(" ").lowercase()
+            if (joined.contains("socket") || joined.contains("/dev/tcp") || joined.contains("rm ") ||
+                joined.contains("subprocess") || joined.contains("pty.spawn")
+            ) {
+                return "Blocked by FRIDAY Security Policy: inline shell/interpreter payload blocked."
+            }
+        }
+        return null
+    }
+
+    private fun isSafeVersionProbe(tokens: List<String>): Boolean {
+        if (tokens.isEmpty()) return false
+        val exe = normalizeExecutableName(tokens[0])
+        val rest = tokens.drop(1)
+        return exe in setOf("python3", "bash", "nmap", "node", "java", "kotlinc", "git") &&
+            rest.size == 1 && (rest[0] == "--version" || rest[0] == "-v" || rest[0] == "-version")
+    }
+
     fun evaluateCommand(
         rawCommand: String,
         environment: TerminalEnvironment,
@@ -117,24 +387,85 @@ object CommandPolicyValidator {
             )
         }
 
-        val blockedMatch = dangerousPatterns.firstOrNull { it.containsMatchIn(cmd) }
-        if (blockedMatch != null) {
+        // Check full-command dangerous signatures across newlines/pipes/subshells
+        if (fullCommandDangerousPatterns.any { it.containsMatchIn(cmd) }) {
             return PendingCommandApproval(
                 command = CredentialRedactor.redact(cmd),
                 environment = environment,
                 riskLevel = CommandRiskLevel.BLOCKED_DANGEROUS,
-                reason = "Blocked by FRIDAY Security Policy: destructive, credential-dumping, or unauthorized exploitation command detected.",
+                reason = "Blocked by FRIDAY Security Policy: destructive, credential-dumping, remote-pipe-to-shell, or reverse-shell pattern detected.",
                 targetHostSummary = targetHostSummary,
                 timeoutSeconds = safeTimeout,
                 isBlocked = true
             )
         }
 
-        val lower = cmd.lowercase()
-        if (lower.startsWith("nmap ") || lower == "nmap") {
-            val tokens = cmd.split(Regex("\\s+")).filter { it.isNotBlank() && !it.startsWith("-") }
-            val targetToken = tokens.drop(1).lastOrNull().orEmpty()
-            val isVersionProbe = lower.contains("--version") || lower == "nmap -v"
+        // Exact allowlisted read-only Termux diagnostic tool probe
+        if (cmd == diagnosticProbeExact) {
+            return PendingCommandApproval(
+                command = cmd,
+                environment = environment,
+                riskLevel = CommandRiskLevel.SAFE_READONLY,
+                reason = "Termux diagnostic tool availability check queued for approval.",
+                targetHostSummary = targetHostSummary,
+                timeoutSeconds = safeTimeout,
+                requiresAuthorizationConfirmation = false,
+                isBlocked = false
+            )
+        }
+
+        val parsed = parseShellStructure(cmd)
+        val tokenizedSegments = parsed.segments.map { tokenizeSegment(it) }
+
+        // Check EVERY segment individually (chaining/subshells cannot bypass inspection)
+        for (segTokens in tokenizedSegments) {
+            val dangerMsg = isDangerousSegment(segTokens)
+            if (dangerMsg != null) {
+                return PendingCommandApproval(
+                    command = CredentialRedactor.redact(cmd),
+                    environment = environment,
+                    riskLevel = CommandRiskLevel.BLOCKED_DANGEROUS,
+                    reason = dangerMsg,
+                    targetHostSummary = targetHostSummary,
+                    timeoutSeconds = safeTimeout,
+                    isBlocked = true
+                )
+            }
+        }
+
+        // Inspect embedded $(...) or `...` subshell fragments as well
+        val embeddedMatches = Regex("""\$\(([^)]+)\)|`([^`]+)`""").findAll(cmd)
+        for (m in embeddedMatches) {
+            val inner = (m.groupValues[1].ifBlank { m.groupValues[2] }).trim()
+            if (inner.isNotBlank()) {
+                val innerEval = evaluateCommand(inner, environment, targetHostSummary, safeTimeout)
+                if (innerEval.isBlocked) {
+                    return innerEval.copy(command = CredentialRedactor.redact(cmd))
+                }
+            }
+        }
+
+        // Block shell statement chaining (;, &&, ||, &, newlines) and command substitution ($(...), backticks)
+        if (parsed.hasChainingOrBackground || parsed.hasCommandSubstitution) {
+            return PendingCommandApproval(
+                command = CredentialRedactor.redact(cmd),
+                environment = environment,
+                riskLevel = CommandRiskLevel.BLOCKED_DANGEROUS,
+                reason = "Blocked by FRIDAY Security Policy: shell command chaining (;, &&, ||, newline) and command substitution (\$(...), backticks) are prohibited.",
+                targetHostSummary = targetHostSummary,
+                timeoutSeconds = safeTimeout,
+                isBlocked = true
+            )
+        }
+
+        // Check standalone single-segment Nmap invocation ONLY when there is no chaining/subshell
+        if (tokenizedSegments.size == 1 &&
+            normalizeExecutableName(tokenizedSegments[0].firstOrNull().orEmpty()) == "nmap"
+        ) {
+            val segTokens = tokenizedSegments[0]
+            val nonFlagArgs = segTokens.drop(1).filter { !it.startsWith("-") }
+            val targetToken = nonFlagArgs.lastOrNull().orEmpty()
+            val isVersionProbe = segTokens.any { it.equals("--version", true) || it == "-V" }
             val isPrivateLab = isPrivateOrLabTarget(targetToken)
             val reason = when {
                 isVersionProbe -> "Nmap version inspection queued for operator approval."
@@ -155,19 +486,35 @@ object CommandPolicyValidator {
             )
         }
 
-        val isReadOnly = readOnlyPrefixes.any { lower == it.trim() || lower.startsWith(it) }
+        // SAFE_READONLY allowed ONLY for strictly single simple command (no chaining, no redirection, no subshell)
+        val isSimpleReadOnly = !parsed.hasChainingOrBackground &&
+            !parsed.hasPipes &&
+            !parsed.hasCommandSubstitution &&
+            !parsed.hasRedirection &&
+            tokenizedSegments.size == 1 &&
+            tokenizedSegments[0].isNotEmpty() &&
+            (normalizeExecutableName(tokenizedSegments[0][0]) in readOnlyCommandAllowlist ||
+                isSafeVersionProbe(tokenizedSegments[0]))
+
+        val elevationNote = when {
+            parsed.hasRedirection ->
+                "Output redirection detected. Verify target path carefully before approving."
+            parsed.hasPipes ->
+                "Piped shell command queued. Confirm authorization before executing."
+            isSimpleReadOnly ->
+                "Inspection command queued for your explicit approval before execution."
+            else ->
+                "Custom shell command queued. Verify flags carefully before approving execution."
+        }
+
         return PendingCommandApproval(
             command = CredentialRedactor.redact(cmd),
             environment = environment,
-            riskLevel = if (isReadOnly) CommandRiskLevel.SAFE_READONLY else CommandRiskLevel.ELEVATED_MODIFY,
-            reason = if (isReadOnly) {
-                "Inspection command queued for your explicit approval before execution."
-            } else {
-                "Custom shell command queued. Verify flags carefully before approving execution."
-            },
+            riskLevel = if (isSimpleReadOnly) CommandRiskLevel.SAFE_READONLY else CommandRiskLevel.ELEVATED_MODIFY,
+            reason = elevationNote,
             targetHostSummary = targetHostSummary,
             timeoutSeconds = safeTimeout,
-            requiresAuthorizationConfirmation = !isReadOnly,
+            requiresAuthorizationConfirmation = !isSimpleReadOnly,
             isBlocked = false
         )
     }
@@ -175,12 +522,14 @@ object CommandPolicyValidator {
 
 /**
  * Parses natural-language FRIDAY conversational commands across English, Hindi & Hinglish
- * and maps them cleanly to actionable workflows without ever executing commands silently.
+ * and maps them cleanly to actionable workflows without ever executing commands silently
+ * or silently guessing default network scan targets.
  */
 object FridayCommandRouter {
 
     private val urlRegex = Regex("""https?://[^\s<>"]+""", RegexOption.IGNORE_CASE)
     private val ipOrCidrRegex = Regex("""\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b""")
+    private val hostTargetAfterPrepRegex = Regex("""(?i)\b(?:scan|on|target|host|nmap)\s+([a-zA-Z0-9][a-zA-Z0-9.\-]{1,62}(?:\.[a-zA-Z]{2,}|localhost))""")
 
     fun requestsHindiResponse(prompt: String): Boolean {
         val lower = prompt.lowercase()
@@ -197,13 +546,25 @@ object FridayCommandRouter {
         val lower = trimmed.lowercase()
         if (trimmed.isEmpty()) return ConversationalAction.None
 
-        // 1. Authorized Nmap request
-        if (lower.contains("nmap") || (lower.contains("scan") && (lower.contains("network") || lower.contains("port") || ipOrCidrRegex.containsMatchIn(trimmed)))) {
-            val target = ipOrCidrRegex.find(trimmed)?.value ?: "192.168.1.0/24"
-            val cmd = "nmap -sn $target"
+        // 1. Authorized Nmap request — NEVER invent a default subnet like 192.168.1.0/24!
+        val isScanIntent = lower.contains("nmap") ||
+            (lower.contains("scan") && (lower.contains("network") || lower.contains("port") || lower.contains("host") || ipOrCidrRegex.containsMatchIn(trimmed)))
+        if (isScanIntent) {
+            val ipTarget = ipOrCidrRegex.find(trimmed)?.value
+            val explicitHost = when {
+                lower.contains("localhost") -> "localhost"
+                else -> hostTargetAfterPrepRegex.find(trimmed)?.groupValues?.getOrNull(1)
+                    ?.takeUnless { it.equals("network", true) || it.equals("port", true) || it.equals("my", true) || it.equals("target", true) }
+            }
+            val target = ipTarget ?: explicitHost
+            if (target.isNullOrBlank()) {
+                return ConversationalAction.AskScanTarget(
+                    "Please specify the authorized IP address, CIDR subnet (for example 127.0.0.1 or your lab LAN range), or hostname to scan with Nmap."
+                )
+            }
             return ConversationalAction.RequestAuthorizedNmap(
                 target = target,
-                suggestedCommand = cmd
+                suggestedCommand = "nmap -sn $target"
             )
         }
 

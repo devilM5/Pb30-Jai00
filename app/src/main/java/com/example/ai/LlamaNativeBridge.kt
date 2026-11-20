@@ -131,6 +131,7 @@ class AndroidLlamaNativeBridge : LlamaInferenceEngine {
         }
 
         abortRequested = false
+        var stopSequenceMatched = false
         val buffer = StringBuilder()
 
         withContext(inferenceDispatcher) {
@@ -142,6 +143,7 @@ class AndroidLlamaNativeBridge : LlamaInferenceEngine {
                         val current = buffer.toString()
                         val hitStop = stopSequences.firstOrNull { stop -> current.contains(stop) }
                         if (hitStop != null) {
+                            stopSequenceMatched = true
                             val trimmed = current.substringBefore(hitStop)
                             trySend(trimmed)
                             return false
@@ -156,11 +158,15 @@ class AndroidLlamaNativeBridge : LlamaInferenceEngine {
                     temperature = temperature.coerceIn(0f, 1.5f),
                     callback = callback
                 )
-                if (rc < 0 && !abortRequested) {
-                    close(IllegalStateException("Dhīr native inference failed (code $rc)."))
-                    return@withContext
+                when {
+                    rc == 0 -> close()
+                    rc == -8 && stopSequenceMatched && !abortRequested -> close()
+                    rc == -8 -> close(CancellationException("Dhīr generation aborted before completion."))
+                    rc == -6 -> close(IllegalStateException("Dhīr prompt decode failed (KV cache/prompt error, code -6)."))
+                    rc == -7 -> close(IllegalStateException("Dhīr generation decode failed mid-reply (code -7)."))
+                    rc == -9 -> close(IllegalStateException("Prompt exceeds active context window ($loadedContextSize tokens, code -9)."))
+                    else -> close(IllegalStateException("Dhīr native inference failed (code $rc)."))
                 }
-                close()
             } catch (c: CancellationException) {
                 runCatching { nativeAbort() }
                 close(c)
@@ -170,7 +176,9 @@ class AndroidLlamaNativeBridge : LlamaInferenceEngine {
         }
 
         awaitClose {
-            abortGeneration()
+            if (!stopSequenceMatched) {
+                abortGeneration()
+            }
         }
     }
 

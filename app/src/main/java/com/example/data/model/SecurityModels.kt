@@ -446,13 +446,31 @@ enum class ExecutionStatusFilter(val label: String) {
     OFFLINE("Offline")
 }
 
+data class OfflineMigrationSummary(
+    val hasPendingPrompt: Boolean = false,
+    val offlineNotesCount: Int = 0,
+    val offlineChatCount: Int = 0,
+    val offlineLearningCount: Int = 0,
+    val offlineTerminalLogsCount: Int = 0,
+    val isMigrating: Boolean = false,
+    val statusDetail: String? = null
+) {
+    val totalMigratableCount: Int
+        get() = offlineNotesCount + offlineChatCount + offlineLearningCount + offlineTerminalLogsCount
+}
+
 data class LoadedProjectFile(
     val uriString: String,
     val fileName: String,
     val mimeType: String,
     val sizeBytes: Long,
     val content: String,
-    val truncated: Boolean = false
+    val truncated: Boolean = false,
+    val encodingLabel: String = "UTF-8",
+    val totalCharsExtracted: Int = content.length,
+    val chunksCount: Int = 1,
+    val currentChunkIndex: Int = 0,
+    val partialReadWarning: String? = null
 )
 
 data class ProposedFilePatch(
@@ -483,6 +501,7 @@ sealed interface ConversationalAction {
     data class OpenCoding(val language: CodeLanguage, val prompt: String) : ConversationalAction
     data class RequestTerminalApproval(val command: String) : ConversationalAction
     data class RequestAuthorizedNmap(val target: String, val suggestedCommand: String) : ConversationalAction
+    data class AskScanTarget(val message: String) : ConversationalAction
     data class RunWebResearch(val query: String, val explainInHindi: Boolean) : ConversationalAction
     data object OpenFileInspector : ConversationalAction
 }

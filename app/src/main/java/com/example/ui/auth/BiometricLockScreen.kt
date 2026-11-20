@@ -1,5 +1,8 @@
 package com.example.ui.auth
 
+import android.app.Activity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -49,6 +52,7 @@ import com.example.R
 import com.example.core.BiometricGateController
 import com.example.core.BiometricSupportStatus
 import com.example.core.DefaultBiometricGateController
+import com.example.core.VaultLifecycleGuard
 import com.example.core.buildBiometricEnrollIntent
 import com.example.core.findFragmentActivity
 import com.example.ui.theme.CyberAmber
@@ -78,11 +82,38 @@ fun BiometricLockScreen(
     val promptTitle = stringResource(R.string.biometric_prompt_title)
     val promptSubtitle = stringResource(R.string.biometric_prompt_subtitle)
 
+    val keyguardConfirmLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { res ->
+        VaultLifecycleGuard.clearExternalFlow()
+        isAuthenticating = false
+        if (res.resultCode == Activity.RESULT_OK) {
+            feedbackMessage = null
+            onUnlocked()
+        } else {
+            feedbackMessage = "Device credential unlock cancelled. Authenticate to access FRIDAY Vault."
+        }
+    }
+
     fun triggerBiometricPrompt() {
         supportResult = controller.checkSupport(context)
         if (supportResult.status != BiometricSupportStatus.READY) {
             feedbackMessage = supportResult.detail
             return
+        }
+        if (supportResult.useKeyguardCredentialFallback) {
+            val confirmIntent = DefaultBiometricGateController.buildConfirmCredentialIntent(
+                context = context,
+                title = promptTitle,
+                subtitle = promptSubtitle
+            )
+            if (confirmIntent != null) {
+                isAuthenticating = true
+                feedbackMessage = null
+                VaultLifecycleGuard.markExternalFlowLaunched()
+                keyguardConfirmLauncher.launch(confirmIntent)
+                return
+            }
         }
         if (activity == null) {
             feedbackMessage = "Host FragmentActivity unavailable for BiometricPrompt."
@@ -106,11 +137,17 @@ fun BiometricLockScreen(
         )
     }
 
-    // Refresh hardware / lock-screen enrollment status if operator returns from Android Security Settings.
+    // Refresh hardware / lock-screen enrollment status on resume and clear stuck prompt state on ON_STOP.
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                supportResult = controller.checkSupport(context)
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> supportResult = controller.checkSupport(context)
+                Lifecycle.Event.ON_STOP -> {
+                    if (activity?.isChangingConfigurations != true && !VaultLifecycleGuard.consumeOrIsWithinExternalFlow()) {
+                        isAuthenticating = false
+                    }
+                }
+                else -> Unit
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -121,7 +158,7 @@ fun BiometricLockScreen(
         if (autoPromptOnStart &&
             !hasAutoPrompted &&
             supportResult.status == BiometricSupportStatus.READY &&
-            activity != null
+            (activity != null || supportResult.useKeyguardCredentialFallback)
         ) {
             hasAutoPrompted = true
             triggerBiometricPrompt()
@@ -264,7 +301,10 @@ fun BiometricLockScreen(
             } else {
                 if (supportResult.status == BiometricSupportStatus.NONE_ENROLLED) {
                     Button(
-                        onClick = { context.startActivity(buildBiometricEnrollIntent(context)) },
+                        onClick = {
+                            VaultLifecycleGuard.markExternalFlowLaunched()
+                            context.startActivity(buildBiometricEnrollIntent(context))
+                        },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = NeonCyan,
                             contentColor = Color.Black

@@ -95,6 +95,25 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import androidx.biometric.BiometricManager
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+import com.example.core.TermuxCommandReceiver
+import com.example.core.VaultLifecycleGuard
+import com.example.core.ProjectFileHelper
+import com.example.data.local.LearningRecordEntity
+import com.example.data.model.WebResearchResult
+import com.example.data.model.YouTubeVideoSummary
+import com.example.data.repository.TerminalBridgeClient
+import java.io.ByteArrayOutputStream
+import java.nio.charset.StandardCharsets
+import java.util.zip.Deflater
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertNull
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
@@ -170,7 +189,11 @@ class FridaySecurityRobolectricTest {
             authMethod = SshAuthMethod.PASSWORD,
             password = "test-password"
         )
-        val result = executor.executeCommand(validProfile, "uname -a", timeoutSeconds = 15)
+        val blockedNoApproval = executor.executeCommand(validProfile, "uname -a", timeoutSeconds = 15, approvedByUser = false)
+        assertFalse(blockedNoApproval.executed)
+        assertEquals(TerminalExecutionStatus.BLOCKED, blockedNoApproval.status)
+
+        val result = executor.executeCommand(validProfile, "uname -a", timeoutSeconds = 15, approvedByUser = true)
         assertFalse(result.executed)
         assertEquals(TerminalExecutionStatus.BRIDGE_UNAVAILABLE, result.status)
         assertTrue(result.stderr.contains("disconnected", ignoreCase = true))
@@ -184,7 +207,11 @@ class FridaySecurityRobolectricTest {
         assertFalse(state.isConnected)
         assertFalse(state.apkInstalled)
 
-        val execWhenDisconnected = client.executeApprovedCommand(state, "python3 --version", 15)
+        val blockedNoApproval = client.executeApprovedCommand(state, "python3 --version", 15, approvedByUser = false)
+        assertFalse(blockedNoApproval.executed)
+        assertEquals(TerminalExecutionStatus.BLOCKED, blockedNoApproval.status)
+
+        val execWhenDisconnected = client.executeApprovedCommand(state, "python3 --version", 15, approvedByUser = true)
         assertFalse(execWhenDisconnected.executed)
         assertEquals(TerminalExecutionStatus.BRIDGE_UNAVAILABLE, execWhenDisconnected.status)
 
@@ -215,8 +242,12 @@ class FridaySecurityRobolectricTest {
         assertTrue(coding is ConversationalAction.OpenCoding)
         assertEquals(CodeLanguage.PYTHON, (coding as ConversationalAction.OpenCoding).language)
 
-        val nmap = FridayCommandRouter.detectAction("FRIDAY, scan my authorized test network using Nmap.")
+        val askTarget = FridayCommandRouter.detectAction("FRIDAY, scan my authorized test network using Nmap.")
+        assertTrue(askTarget is ConversationalAction.AskScanTarget)
+
+        val nmap = FridayCommandRouter.detectAction("FRIDAY, scan 192.168.56.0/24 using Nmap.")
         assertTrue(nmap is ConversationalAction.RequestAuthorizedNmap)
+        assertEquals("192.168.56.0/24", (nmap as ConversationalAction.RequestAuthorizedNmap).target)
 
         val term = FridayCommandRouter.detectAction("FRIDAY, run this approved terminal command: `uname -a`")
         assertTrue(term is ConversationalAction.RequestTerminalApproval)
@@ -551,8 +582,10 @@ class FridaySecurityRobolectricTest {
         }
         composeRule.waitForIdle()
         composeRule.onNodeWithText("FRIDAY AI HUB").assertIsDisplayed()
+        composeRule.onNodeWithTag("friday_dashboard_screen").performScrollToNode(hasTestTag("hub_card_chat"))
         composeRule.onNodeWithTag("hub_card_chat").assertIsDisplayed().performClick()
         assertEquals("chat", openedTarget)
+        composeRule.onNodeWithTag("friday_dashboard_screen").performScrollToNode(hasTestTag("hub_card_sec_agent"))
         composeRule.onNodeWithTag("hub_card_sec_agent").assertIsDisplayed().performClick()
         assertEquals("sec_agent", openedTarget)
     }
@@ -962,7 +995,7 @@ class FridaySecurityRobolectricTest {
             val saveRes = repo.saveNote(
                 title = "Nmap Verification Brief",
                 content = "Checked port 22 on authorized lab host using token=secret_abc123",
-                category = NoteCategory.LAB_REPORT,
+                category = NoteCategory.AGENT_BRIEF,
                 userIdOverride = uid
             )
             assertTrue(saveRes.isSuccess)
@@ -996,7 +1029,9 @@ class FridaySecurityRobolectricTest {
 
             val searchHit = repo.searchLocalKnowledge(uid, "Nmap")
             assertTrue(searchHit.contains("Nmap Verification Brief"))
-            assertTrue(searchHit.contains("-sV service version"))
+            assertTrue(searchHit.contains("Hinglish mein Nmap flags"))
+            val replySearchHit = repo.searchLocalKnowledge(uid, "service version")
+            assertTrue(replySearchHit.contains("-sV service version"))
         } finally {
             db.close()
         }
@@ -1011,7 +1046,7 @@ class FridaySecurityRobolectricTest {
         try {
             val uid = MemoryRepository.LOCAL_OFFLINE_USER_ID
             val memoryRepo = MemoryRepository(dao = db.fridayDao(), db = null, auth = null, context = context)
-            memoryRepo.saveNote("SQLi Prevention", "Use parameterized queries to mitigate SQL injection.", NoteCategory.CYBERSECURITY, userIdOverride = uid)
+            memoryRepo.saveNote("SQLi Prevention", "Use parameterized queries to mitigate SQL injection.", NoteCategory.OWASP, userIdOverride = uid)
 
             val webRepo = WebToolsRepository()
             val stagedCommands = mutableListOf<String>()
@@ -1026,6 +1061,23 @@ class FridaySecurityRobolectricTest {
                 ): Flow<String> = flow {
                     emit("Prepared command proposal.")
                 }
+
+                override suspend fun performWebResearch(
+                    query: String,
+                    languageMode: LanguageMode,
+                    explainInHindi: Boolean,
+                    modelOption: AiModelOption
+                ): WebResearchResult = WebResearchResult(
+                    query = query,
+                    answer = "Prepared research output.",
+                    citations = emptyList(),
+                    searchQueriesUsed = listOf(query),
+                    explainedInHindi = explainInHindi
+                )
+
+                override suspend fun ensureDhirLoaded(modelOption: AiModelOption): Result<Unit> = Result.success(Unit)
+                override fun unloadDhir() = Unit
+                override fun abortGeneration() = Unit
             }
 
             // 1. Test tool call routing & mandatory CommandApprovalDialog staging
@@ -1059,7 +1111,7 @@ class FridaySecurityRobolectricTest {
             assertTrue(envStatus.contains("Termux Bridge: DISCONNECTED"))
             assertTrue(envStatus.contains("Remote Linux SSH: DISCONNECTED"))
 
-            // 2. Test honest missing-model response with real local memory tool execution
+            // 2. Test honest missing-model response with real local memory tool execution (English & Hindi)
             val chunks = orchestrator.orchestrateChatTurn(
                 userPrompt = "Check my saved notes for SQLi prevention",
                 languageMode = LanguageMode.ENGLISH,
@@ -1072,6 +1124,431 @@ class FridaySecurityRobolectricTest {
             assertTrue(finalChunk.streamingText.contains("dhir-2b-Q4_K_M.gguf"))
             assertTrue(finalChunk.streamingText.contains("parameterized queries"))
             assertTrue(finalChunk.toolTraces.any { it.toolName == "search_memory" })
+
+            val hindiChunks = orchestrator.orchestrateChatTurn(
+                userPrompt = "mere saved notes mein SQLi batao",
+                languageMode = LanguageMode.HINDI,
+                modelOption = AiModelOption.DHIR_2B_BALANCED,
+                history = emptyList()
+            ).toList()
+            assertTrue(hindiChunks.last().streamingText.contains("इंस्टॉल नहीं है"))
+            assertTrue(hindiChunks.last().toolTraces.any { it.toolName == "search_memory" })
+
+            // 3. Test multilingual Hinglish/Devanagari routing predicates
+            assertTrue(orchestrator.shouldTriggerWebSearch("CVE-2025 online khojo"))
+            assertTrue(orchestrator.shouldTriggerWebSearch("इंटरनेट परZero Trust खोजो"))
+            assertTrue(orchestrator.shouldLookupMemory("mere notes dikhao"))
+            assertTrue(orchestrator.shouldLookupMemory("पुरानी चैट याद है?"))
+            assertTrue(orchestrator.shouldInspectEnvironments("ssh connect hai kya"))
+            assertTrue(orchestrator.shouldTriggerYouTubeSearch("यूट्यूब पर Nmap वीडियो खोजो"))
+            assertFalse(orchestrator.extractCleanYouTubeQuery("यूट्यूब पर Nmap वीडियो खोजो").contains("यूट्यूब"))
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun termuxCommandReceiverParsesOfficialResultBundleAndExitCodeVariants() {
+        val officialIntent = Intent().apply {
+            putExtra(
+                TermuxCommandReceiver.TERMUX_RESULT_BUNDLE_KEY,
+                Bundle().apply {
+                    putString("stdout", "uid=10234(u0_a234)")
+                    putString("stderr", "")
+                    putInt("exitCode", 0)
+                    putInt("err", 0)
+                }
+            )
+        }
+        val officialParsed = TermuxCommandReceiver.parseResultIntent(officialIntent, this::class.java.classLoader)
+        assertEquals("uid=10234(u0_a234)", officialParsed.stdout)
+        assertEquals(0, officialParsed.exitCode)
+        assertEquals(0, officialParsed.internalErrCode)
+
+        val snakeCaseIntent = Intent().apply {
+            putExtra(
+                TermuxCommandReceiver.TERMUX_RESULT_BUNDLE_KEY,
+                Bundle().apply {
+                    putString("stdout", "nmap 7.95")
+                    putInt("exit_code", 2)
+                    putInt("err", -1)
+                    putString("errmsg", "partial")
+                }
+            )
+        }
+        val snakeParsed = TermuxCommandReceiver.parseResultIntent(snakeCaseIntent, null)
+        assertEquals("nmap 7.95", snakeParsed.stdout)
+        assertEquals(2, snakeParsed.exitCode)
+        assertEquals(-1, snakeParsed.internalErrCode)
+        assertEquals("partial", snakeParsed.internalErrMsg)
+
+        val missingBundle = TermuxCommandReceiver.parseResultIntent(Intent(), null)
+        assertEquals(-1, missingBundle.exitCode)
+        assertTrue(missingBundle.stderr.contains("allow-external-apps=true"))
+    }
+
+    @Test
+    fun biometricAuthHelperSupportsApi24To29DeviceCredentialAndPinFallback() {
+        val api28Auths = DefaultBiometricGateController.supportedAuthenticatorsForSdk(Build.VERSION_CODES.P)
+        assertEquals(
+            BiometricManager.Authenticators.BIOMETRIC_WEAK or BiometricManager.Authenticators.DEVICE_CREDENTIAL,
+            api28Auths
+        )
+        assertEquals(
+            BiometricManager.Authenticators.BIOMETRIC_WEAK,
+            api28Auths and BiometricManager.Authenticators.BIOMETRIC_WEAK
+        )
+        assertFalse(
+            api28Auths == (BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+        )
+
+        val api31Auths = DefaultBiometricGateController.supportedAuthenticatorsForSdk(Build.VERSION_CODES.S)
+        assertEquals(
+            BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL,
+            api31Auths
+        )
+
+        // API 28 device with PIN/Pattern set and no fingerprint hardware/enrollment -> READY via Keyguard fallback
+        val pinOnlyApi28 = DefaultBiometricGateController.evaluateSupport(
+            sdkInt = Build.VERSION_CODES.P,
+            biometricCanAuthCode = BiometricManager.BIOMETRIC_ERROR_NO_HARDWARE,
+            keyguardDeviceSecure = true,
+            hasKeyguardConfirmIntent = true
+        )
+        assertEquals(BiometricSupportStatus.READY, pinOnlyApi28.status)
+        assertTrue(pinOnlyApi28.useKeyguardCredentialFallback)
+
+        // API 26 device with NONE_ENROLLED biometrics but PIN set -> READY via Keyguard fallback
+        val noneBioWithPin = DefaultBiometricGateController.evaluateSupport(
+            sdkInt = Build.VERSION_CODES.O,
+            biometricCanAuthCode = BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED,
+            keyguardDeviceSecure = true,
+            hasKeyguardConfirmIntent = true
+        )
+        assertEquals(BiometricSupportStatus.READY, noneBioWithPin.status)
+        assertTrue(noneBioWithPin.useKeyguardCredentialFallback)
+
+        // No PIN and no biometrics -> NONE_ENROLLED
+        val unlockedDevice = DefaultBiometricGateController.evaluateSupport(
+            sdkInt = Build.VERSION_CODES.P,
+            biometricCanAuthCode = BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED,
+            keyguardDeviceSecure = false,
+            hasKeyguardConfirmIntent = false
+        )
+        assertEquals(BiometricSupportStatus.NONE_ENROLLED, unlockedDevice.status)
+
+        // VaultLifecycleGuard tracks transient external SAF/Settings pickers
+        VaultLifecycleGuard.clearExternalFlow()
+        assertFalse(VaultLifecycleGuard.consumeOrIsWithinExternalFlow())
+        VaultLifecycleGuard.markExternalFlowLaunched(10_000L)
+        assertTrue(VaultLifecycleGuard.consumeOrIsWithinExternalFlow())
+        VaultLifecycleGuard.clearExternalFlow()
+    }
+
+    @Test
+    fun networkSecurityAndBackupConfigsEnforceLeastPrivilegeAndExcludeSecrets() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val parser = context.resources.getXml(R.xml.network_security_config)
+        var baseCleartext: Boolean? = null
+        val allowedDomains = mutableListOf<String>()
+        var insideCleartextDomain = false
+
+        var eventType = parser.eventType
+        while (eventType != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+            if (eventType == org.xmlpull.v1.XmlPullParser.START_TAG) {
+                when (parser.name) {
+                    "base-config" -> {
+                        val attr = parser.getAttributeValue(null, "cleartextTrafficPermitted")
+                        baseCleartext = attr?.toBooleanStrictOrNull()
+                    }
+                    "domain-config" -> {
+                        val attr = parser.getAttributeValue(null, "cleartextTrafficPermitted")
+                        insideCleartextDomain = attr == "true"
+                    }
+                    "domain" -> {
+                        if (insideCleartextDomain) {
+                            allowedDomains += parser.nextText().trim()
+                        }
+                    }
+                }
+            } else if (eventType == org.xmlpull.v1.XmlPullParser.END_TAG && parser.name == "domain-config") {
+                insideCleartextDomain = false
+            }
+            eventType = parser.next()
+        }
+
+        assertEquals(false, baseCleartext)
+        assertEquals(listOf("127.0.0.1", "localhost"), allowedDomains)
+
+        // Verify backup_rules.xml & data_extraction_rules.xml exclude sensitive vault assets
+        fun readExcludedPaths(xmlResId: Int): Set<String> {
+            val xml = context.resources.getXml(xmlResId)
+            val paths = mutableSetOf<String>()
+            var ev = xml.eventType
+            while (ev != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+                if (ev == org.xmlpull.v1.XmlPullParser.START_TAG && xml.name == "exclude") {
+                    xml.getAttributeValue(null, "path")?.let { paths += it }
+                }
+                ev = xml.next()
+            }
+            return paths
+        }
+        val legacyExcludes = readExcludedPaths(R.xml.backup_rules)
+        val cloudExcludes = readExcludedPaths(R.xml.data_extraction_rules)
+        assertTrue(legacyExcludes.contains("friday_remote_server_encrypted_prefs.xml"))
+        assertTrue(legacyExcludes.contains("friday_local_vault.db"))
+        assertTrue(legacyExcludes.contains("friday_ssh_known_hosts"))
+        assertTrue(cloudExcludes.contains("friday_remote_server_encrypted_prefs.xml"))
+        assertTrue(cloudExcludes.contains("friday_local_vault.db"))
+        assertTrue(cloudExcludes.contains("models"))
+    }
+
+    @Test
+    fun roomDatabaseMigration1To2PreservesAllUserRecordsAndUniqueLearningKeys() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val dbName = "friday_mig_test_${System.currentTimeMillis()}.db"
+        val factory = FrameworkSQLiteOpenHelperFactory()
+        val helper = factory.create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(dbName)
+                .callback(object : SupportSQLiteOpenHelper.Callback(1) {
+                    override fun onCreate(db: SupportSQLiteDatabase) {
+                        db.execSQL(
+                            "CREATE TABLE IF NOT EXISTS notes (" +
+                                "id TEXT NOT NULL PRIMARY KEY, userId TEXT NOT NULL, title TEXT NOT NULL, " +
+                                "content TEXT NOT NULL, category TEXT NOT NULL, pinned INTEGER NOT NULL, " +
+                                "createdAtMillis INTEGER NOT NULL, updatedAtMillis INTEGER NOT NULL, " +
+                                "pendingSync INTEGER NOT NULL, pendingDelete INTEGER NOT NULL)"
+                        )
+                        db.execSQL(
+                            "CREATE INDEX IF NOT EXISTS index_notes_userId_pendingDelete_pinned_updatedAtMillis " +
+                                "ON notes (userId, pendingDelete, pinned, updatedAtMillis)"
+                        )
+                        db.execSQL(
+                            "CREATE INDEX IF NOT EXISTS index_notes_userId_pendingSync ON notes (userId, pendingSync)"
+                        )
+                        db.execSQL(
+                            "CREATE TABLE IF NOT EXISTS chat_messages (" +
+                                "id TEXT NOT NULL PRIMARY KEY, userId TEXT NOT NULL, role TEXT NOT NULL, " +
+                                "content TEXT NOT NULL, languageMode TEXT NOT NULL, agentType TEXT NOT NULL, " +
+                                "createdAtMillis INTEGER NOT NULL, pendingSync INTEGER NOT NULL, pendingDelete INTEGER NOT NULL)"
+                        )
+                        db.execSQL(
+                            "CREATE INDEX IF NOT EXISTS index_chat_messages_userId_pendingDelete_createdAtMillis " +
+                                "ON chat_messages (userId, pendingDelete, createdAtMillis)"
+                        )
+                        db.execSQL(
+                            "CREATE INDEX IF NOT EXISTS index_chat_messages_userId_pendingSync ON chat_messages (userId, pendingSync)"
+                        )
+                        db.execSQL(
+                            "CREATE TABLE IF NOT EXISTS terminal_logs (" +
+                                "id TEXT NOT NULL PRIMARY KEY, userId TEXT NOT NULL, command TEXT NOT NULL, " +
+                                "environment TEXT NOT NULL, status TEXT NOT NULL, output TEXT NOT NULL, " +
+                                "exitCode INTEGER NOT NULL, approvedByUser INTEGER NOT NULL, " +
+                                "localOnly INTEGER NOT NULL, createdAtMillis INTEGER NOT NULL)"
+                        )
+                        db.execSQL(
+                            "CREATE INDEX IF NOT EXISTS index_terminal_logs_userId_createdAtMillis ON terminal_logs (userId, createdAtMillis)"
+                        )
+                        db.execSQL(
+                            "CREATE TABLE IF NOT EXISTS learning_records (" +
+                                "id TEXT NOT NULL PRIMARY KEY, userId TEXT NOT NULL, recordType TEXT NOT NULL, " +
+                                "itemId TEXT NOT NULL, completed INTEGER NOT NULL, updatedAtMillis INTEGER NOT NULL)"
+                        )
+                        db.execSQL(
+                            "CREATE INDEX IF NOT EXISTS index_learning_records_userId_recordType ON learning_records (userId, recordType)"
+                        )
+                        // Seed v1 rows including duplicate (userId, recordType, itemId)
+                        db.execSQL("INSERT INTO notes VALUES ('n1','u1','Keep Me','Safe data','GENERAL',1,100,200,0,0)")
+                        db.execSQL("INSERT INTO learning_records VALUES ('u1::QUIZ::mod1','u1','QUIZ','mod1',0,100)")
+                        db.execSQL("INSERT INTO learning_records VALUES ('legacy_dup','u1','QUIZ','mod1',1,200)")
+                    }
+
+                    override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+                })
+                .build()
+        )
+        helper.writableDatabase.close()
+
+        val roomDb = Room.databaseBuilder(context, FridayDatabase::class.java, dbName)
+            .addMigrations(*FridayDatabase.ALL_MIGRATIONS)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val migratedNote = roomDb.fridayDao().getNoteById("n1")
+            assertNotNull(migratedNote)
+            assertEquals("Keep Me", migratedNote?.title)
+
+            val records = roomDb.fridayDao().getAllLearningRecordsForUser("u1")
+            assertEquals(1, records.size)
+            assertTrue(records.first().completed)
+
+            val repo = MemoryRepository(dao = roomDb.fridayDao(), db = null, auth = null, context = context)
+            repo.saveYouTubeLearningRecord(
+                userId = "u1",
+                video = YouTubeVideoSummary(
+                    videoId = "abc123",
+                    title = "Nmap Basics Hindi",
+                    channel = "CyberSec",
+                    url = "https://www.youtube.com/watch?v=abc123",
+                    transcriptExcerpt = "Use nmap -sV only on authorized systems.",
+                    transcriptAvailable = true
+                )
+            )
+            val ytRecords = repo.getRecentYouTubeLearningRecords("u1")
+            assertEquals(1, ytRecords.size)
+            assertEquals("Nmap Basics Hindi", ytRecords.first().title)
+        } finally {
+            roomDb.close()
+            context.deleteDatabase(dbName)
+        }
+    }
+
+    @Test
+    fun securitySanitizerAndBridgeClientBlockBypassOperatorsAndUnapprovedExecution() = runBlocking {
+        // Structural shell injection bypasses that previously slipped past simple substring checks
+        assertTrue(CommandPolicyValidator.evaluateCommand("ls; id", TerminalEnvironment.TERMUX_BRIDGE).isBlocked)
+        assertTrue(CommandPolicyValidator.evaluateCommand("uname $(cat /etc/passwd)", TerminalEnvironment.TERMUX_BRIDGE).isBlocked)
+        assertTrue(CommandPolicyValidator.evaluateCommand("echo `id`", TerminalEnvironment.TERMUX_BRIDGE).isBlocked)
+        assertTrue(CommandPolicyValidator.evaluateCommand("ls\nrm -rf /", TerminalEnvironment.TERMUX_BRIDGE).isBlocked)
+        assertTrue(CommandPolicyValidator.evaluateCommand("bash -c 'uname -a'", TerminalEnvironment.TERMUX_BRIDGE).isBlocked)
+
+        // Ambiguous Nmap prompt without target must ask for target instead of guessing 192.168.1.0/24
+        val action = FridayCommandRouter.detectAction("FRIDAY, scan my authorized test network using Nmap")
+        assertTrue(action is ConversationalAction.AskScanTarget)
+
+        val explicitTargetAction = FridayCommandRouter.detectAction("FRIDAY, scan 10.10.1.0/24 using Nmap")
+        assertTrue(explicitTargetAction is ConversationalAction.RequestAuthorizedNmap)
+
+        // Execution boundary rejects approvedByUser = false even for benign command
+        val bridgeClient = TerminalBridgeClient()
+        val rejected = bridgeClient.executeApprovedCommand(
+            command = "uname -a",
+            environment = TerminalEnvironment.TERMUX_BRIDGE,
+            endpointUrl = "http://127.0.0.1:8022",
+            sessionToken = "tok",
+            approvedByUser = false
+        )
+        assertFalse(rejected.executed)
+        assertEquals(TerminalExecutionStatus.BLOCKED, rejected.status)
+    }
+
+    @Test
+    fun projectFileHelperHandlesUtf16FlatePdfBinaryRejectionAndChunks() {
+        // UTF-16LE BOM decoding
+        val utf16Body = "नमस्ते FRIDAY\nLine 2".toByteArray(StandardCharsets.UTF_16LE)
+        val utf16WithBom = byteArrayOf(0xFF.toByte(), 0xFE.toByte()) + utf16Body
+        val utf16File = ProjectFileHelper.parseLoadedBytes(
+            uriString = "content://test/readme.txt",
+            fileName = "readme.txt",
+            mimeType = "text/plain",
+            reportedSize = utf16WithBom.size.toLong(),
+            rawBytes = utf16WithBom
+        ).getOrThrow()
+        assertEquals("UTF-16LE", utf16File.encodingLabel)
+        assertTrue(utf16File.content.contains("नमस्ते FRIDAY"))
+
+        // Binary NUL payload rejection
+        val binaryRes = ProjectFileHelper.parseLoadedBytes(
+            uriString = "content://test/app.bin",
+            fileName = "app.bin",
+            mimeType = "application/octet-stream",
+            reportedSize = 64,
+            rawBytes = ByteArray(64) { if (it % 2 == 0) 0 else 0x41 }
+        )
+        assertTrue(binaryRes.isFailure)
+
+        // FlateDecode PDF extraction
+        val contentStreamText = "BT\n/F1 12 Tf\n(Hello FRIDAY PDF Security) Tj\nET"
+        val deflater = Deflater()
+        deflater.setInput(contentStreamText.toByteArray(StandardCharsets.ISO_8859_1))
+        deflater.finish()
+        val compressedOut = ByteArrayOutputStream()
+        val buf = ByteArray(256)
+        while (!deflater.finished()) {
+            compressedOut.write(buf, 0, deflater.deflate(buf))
+        }
+        deflater.end()
+        val pdfBytes = buildString {
+            append("%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n")
+            append("2 0 obj << /Filter /FlateDecode /Length ${compressedOut.size()} >>\nstream\n")
+        }.toByteArray(StandardCharsets.ISO_8859_1) +
+            compressedOut.toByteArray() +
+            "\nendstream\nendobj\n%%EOF".toByteArray(StandardCharsets.ISO_8859_1)
+
+        val pdfLoaded = ProjectFileHelper.parseLoadedBytes(
+            uriString = "content://test/audit.pdf",
+            fileName = "audit.pdf",
+            mimeType = "application/pdf",
+            reportedSize = pdfBytes.size.toLong(),
+            rawBytes = pdfBytes
+        ).getOrThrow()
+        assertTrue(pdfLoaded.content.contains("Hello FRIDAY PDF Security"))
+        assertTrue(pdfLoaded.encodingLabel.startsWith("PDF Text"))
+
+        // Chunked big file coverage
+        val largeContent = "A".repeat(25_000).toByteArray(StandardCharsets.UTF_8)
+        val chunked = ProjectFileHelper.parseLoadedBytes(
+            uriString = "content://test/large.log",
+            fileName = "large.log",
+            mimeType = "text/plain",
+            reportedSize = largeContent.size.toLong(),
+            rawBytes = largeContent
+        ).getOrThrow()
+        assertEquals(3, chunked.chunksCount)
+        assertTrue(chunked.truncated)
+        assertNotNull(chunked.partialReadWarning)
+        assertEquals(12_000, ProjectFileHelper.getChunk(chunked.content, 0).length)
+        assertEquals(1_000, ProjectFileHelper.getChunk(chunked.content, 2).length)
+    }
+
+    @Test
+    fun offlineMigrationRequiresConsentDeduplicatesAndKeepsAgentHistoriesIsolated() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, FridayDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val repo = MemoryRepository(dao = db.fridayDao(), db = null, auth = null, context = context)
+            val offlineUid = MemoryRepository.LOCAL_OFFLINE_USER_ID
+            val targetUid = "firebase_uid_42"
+
+            repo.saveNote("Offline Key Takeaway", "Validate redirects server-side.", NoteCategory.OWASP, userIdOverride = offlineUid)
+            repo.saveChatMessage("USER", "Offline chat msg", LanguageMode.ENGLISH, AgentType.CHAT, offlineUid)
+            repo.saveTerminalLog("uname -a", TerminalEnvironment.TERMUX_BRIDGE, TerminalExecutionStatus.EXECUTED, "Linux", 0, true, offlineUid)
+            repo.markQuizCompleted(offlineUid, "web_basics")
+
+            // 1. Pre-populate duplicate note on target account
+            repo.saveNote("Offline Key Takeaway", "Validate redirects server-side.", NoteCategory.OWASP, userIdOverride = targetUid)
+
+            // 2. Reject without consent
+            val denied = repo.migrateOfflineDataWithConsent(targetUid, explicitUserConsent = false)
+            assertTrue(denied.isFailure)
+
+            // 3. Migrate with consent -> duplicate note skipped, chat/log/quiz migrated, source cleared
+            val summaryBefore = repo.inspectOfflineMigrationCandidate(targetUid)
+            assertTrue(summaryBefore.hasPendingPrompt)
+            assertEquals(4, summaryBefore.totalMigratableCount)
+
+            val migrated = repo.migrateOfflineDataWithConsent(targetUid, explicitUserConsent = true).getOrThrow()
+            assertEquals(3, migrated) // duplicate note was NOT duplicated
+
+            assertEquals(1, repo.observeNotes(targetUid).first().size)
+            assertEquals(1, repo.observeChatMessages(targetUid).first().size)
+            val targetLogs = db.fridayDao().observeTerminalLogs(targetUid).first()
+            assertEquals(1, targetLogs.size)
+            assertTrue(targetLogs.first().localOnly)
+            assertFalse(repo.inspectOfflineMigrationCandidate(targetUid).hasPendingPrompt)
+
+            // 4. Scoped agent history isolation (CHAT vs CODING vs REPORT_ANALYSIS)
+            repo.saveChatMessage("USER", "Write a Kotlin parser", LanguageMode.ENGLISH, AgentType.CODING, targetUid)
+            repo.saveChatMessage("FRIDAY", "fun parse() = Unit", LanguageMode.ENGLISH, AgentType.CODING, targetUid)
+
+            val chatScoped = repo.getScopedAgentHistory(targetUid, AgentType.CHAT, "Offline")
+            val codingScoped = repo.getScopedAgentHistory(targetUid, AgentType.CODING, "Kotlin")
+            assertEquals(1, chatScoped.size)
+            assertFalse(chatScoped.any { it.second.contains("fun parse") })
+            assertEquals(2, codingScoped.size)
         } finally {
             db.close()
         }
